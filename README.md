@@ -47,7 +47,7 @@ npm run dev
 
 1. 在 Cloudflare Dashboard → **Workers & Pages** → 点击 **创建** → **Workers** → **连接到 Git**
 2. 选择你的 GitHub 仓库，在构建设置中使用默认选项，点击**保存并部署**
-3. Cloudflare Pages 会自动构建并部署 Worker，同时自动创建 `KV` 命名空间并绑定
+3. Cloudflare 会自动构建并部署 Worker，同时自动创建 `KV` 命名空间并绑定
 4. 部署完成后，进入 Worker 页面 → **Settings** → **Variables**，添加：
   - `ADMIN_USERNAME` — 管理后台登录用户名
   - `ADMIN_PASSWORD` — 管理后台登录密码
