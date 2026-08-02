@@ -1,0 +1,10 @@
+[
+  {
+    "date": "2026-08-02",
+    "scope": "app",
+    "macrostructure": "Workbench / Split security entry / Control plane",
+    "theme": "Cobalt custom system",
+    "enrichment": "graphite endpoint panel",
+    "brief": "Redesign AI Gateway home, login and admin pages using Cloud Workbench"
+  }
+]
