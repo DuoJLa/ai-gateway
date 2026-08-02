@@ -140,7 +140,6 @@ ${H('首页')}
   <div class="shell site-footer__inner">
     <span>© ${new Date().getFullYear()} ${SITE_CONFIG.title}</span>
     <span>Cloudflare Workers · Hono · KV</span>
-    <span>by <a href="${SITE_CONFIG.blogUrl}" target="_blank" rel="noreferrer">${SITE_CONFIG.author}</a></span>
   </div>
 </footer>
 
@@ -191,7 +190,6 @@ ${H('首页')}
 // ===== 登录页 =====
 
 export async function renderLoginPage(c: Context<{ Bindings: Env }>) {
-  const host = c.req.header('host') || 'localhost:8787'
   return c.html(`<!DOCTYPE html><html lang="zh-CN">
 ${H('登录')}
 <body class="site-page auth-page">
@@ -209,12 +207,6 @@ ${H('登录')}
   <section class="auth-context" aria-labelledby="auth-context-title">
     <p class="eyebrow"><span aria-hidden="true"></span>CONTROL PLANE ACCESS</p>
     <h1 id="auth-context-title">管理提供商、模型和转发密钥。</h1>
-    <p>管理员凭据由 Cloudflare 环境变量提供，不会保存在浏览器中。</p>
-    <dl class="auth-facts">
-      <div><dt>API 入口</dt><dd><code>https://${escapePageHtml(host)}/v1</code></dd></div>
-      <div><dt>会话有效期</dt><dd>7 天</dd></div>
-      <div><dt>Cookie 策略</dt><dd>HttpOnly · Secure · SameSite=Lax</dd></div>
-    </dl>
   </section>
 
   <section class="auth-form-wrap" aria-labelledby="login-title">
@@ -832,6 +824,23 @@ async function toggleProxyKey(id, checked) {
     }
   } else toast(d.message || '操作失败', 'error')
 }
+
+// 中文说明：根据点击和 URL 锚点同步侧栏选中态，避免导航始终停留在“概览”。
+const adminNavLinks = Array.from(document.querySelectorAll('.admin-nav a[href^="#"]'))
+function setActiveAdminNav(hash) {
+  const targetHash = adminNavLinks.some(function (link) { return link.getAttribute('href') === hash }) ? hash : '#overview'
+  adminNavLinks.forEach(function (link) {
+    const active = link.getAttribute('href') === targetHash
+    link.classList.toggle('is-active', active)
+    if (active) link.setAttribute('aria-current', 'page')
+    else link.removeAttribute('aria-current')
+  })
+}
+adminNavLinks.forEach(function (link) {
+  link.addEventListener('click', function () { setActiveAdminNav(link.getAttribute('href') || '#overview') })
+})
+window.addEventListener('hashchange', function () { setActiveAdminNav(location.hash) })
+setActiveAdminNav(location.hash)
 </script>
 </body></html>`)
 }
