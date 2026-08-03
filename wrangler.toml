@@ -8,7 +8,14 @@ keep_vars = true
 [[kv_namespaces]]
 binding = "KV"
 
-# Admin credentials (set these in Cloudflare Dashboard > Workers > Variables)
+[vars]
+USAGE_ANALYTICS_DATASET = "ai_gateway_usage"
+
+[[analytics_engine_datasets]]
+binding = "USAGE_ANALYTICS"
+dataset = "ai_gateway_usage"
+
+# Admin credentials and Analytics SQL credentials are set in Cloudflare Dashboard.
 # [vars]
 # ADMIN_USERNAME = "admin"
 # ADMIN_PASSWORD = "your-password"

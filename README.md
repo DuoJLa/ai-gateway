@@ -15,7 +15,8 @@
 - **两级启用控制** — 提供商级别 + 模型级别的启用/禁用
 - **转发 Key 认证** — 生成 `sk_cf_*` 格式的 API Key，支持有效期管理
 - **模型连接测试** — 管理后台手动测试模型是否可连接（通过服务端代理，无跨域限制）
-- **管理后台** — 卡片式 UI，移动端自适应，无需前端构建
+- **使用统计与详细日志** — 基于 Analytics Engine 展示请求总量、成功率、输入/输出 Token、平均延迟、模型/渠道排行，并支持请求日志筛选与详情查看
+- **管理后台** — Cloud Workbench 控制平面 UI，支持桌面侧栏与移动端日志卡片，无需前端构建
 
 ## 技术栈
 
@@ -51,6 +52,8 @@ npm run dev
 4. 部署完成后，进入 Worker 页面 → **Settings** → **Variables**，添加：
   - `ADMIN_USERNAME` — 管理后台登录用户名
   - `ADMIN_PASSWORD` — 管理后台登录密码
+  - `CF_ACCOUNT_ID` — Cloudflare Account ID，用于管理后台查询 Analytics Engine SQL
+  - `CF_API_TOKEN` — 具有 Analytics Engine SQL 查询权限的 Cloudflare API Token
   - `OPENCODE_MIRRORS_URL` — OpenCode 镜像地址列表，每行一个 URL或用 `,` 分隔。填写以下三个地址：
   
   ```
@@ -68,7 +71,7 @@ npm run dev
 1. Fork 或推送代码到你的 GitHub 仓库
 
 2. 在 GitHub 仓库 Settings → **Secrets and variables** → **Actions** 中配置：
-   - **Secrets**：`CF_API_TOKEN`（Cloudflare API Token，权限需包含 Workers 编辑）
+   - **Secrets**：`CF_API_TOKEN`（Cloudflare API Token，权限需包含 Workers 编辑与 Analytics Engine SQL 查询）、`CF_ACCOUNT_ID`
    - **Variables**：`ADMIN_USERNAME`、`ADMIN_PASSWORD`、`OPENCODE_MIRRORS_URL`（可选，追加额外镜像地址，每行一个，默认已包含上述三个镜像地址）
 
 3. 在 GitHub 仓库 Actions 页面手动触发 **Deploy to Cloudflare Workers** 工作流
@@ -100,6 +103,8 @@ ai-gateway/
 │   ├── proxy.ts       # API 转发核心（Key 轮询 + 健康检查 + 自动恢复）
 │   ├── opencode.ts    # OpenCode 官方 API 与公共镜像故障转移
 │   ├── admin.ts       # 管理 API（含服务端 Key/模型测试代理）
+│   ├── analytics/     # Analytics Engine 采集、SQL 查询与管理接口
+│   ├── analytics-ui.js.ts # 看板、排行与详细日志交互
 │   ├── pages.ts       # 前端页面模板
 │   ├── pages.css.ts   # 样式
 │   └── shared.js.ts   # 共享 JS 工具函数

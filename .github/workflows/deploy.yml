@@ -28,6 +28,11 @@ jobs:
         run: npm ci
 
       - name: Generate wrangler.toml with admin credentials
+        env:
+          ADMIN_USERNAME: ${{ vars.ADMIN_USERNAME }}
+          ADMIN_PASSWORD: ${{ vars.ADMIN_PASSWORD }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          EXTRA_URLS: ${{ vars.OPENCODE_MIRRORS_URL }}
         run: |
           DEFAULT_URLS=(
             "https://opencode.ai.cmliussss.net/zen/v1"
@@ -35,7 +40,7 @@ jobs:
             "https://opencode.gcore.cmliussss.net/zen/v1"
           )
           MIRRORS_URL=$(printf '%s\\n' "${DEFAULT_URLS[@]}" | sed '$s/\\n$//')
-          EXTRA_URLS="${{ vars.OPENCODE_MIRRORS_URL }}"
+          EXTRA_URLS="$EXTRA_URLS"
           if [ -n "$EXTRA_URLS" ]; then
             MIRRORS_URL="${MIRRORS_URL}\n${EXTRA_URLS}"
           fi
@@ -49,9 +54,15 @@ jobs:
           [[kv_namespaces]]
           binding = "KV"
 
+          [[analytics_engine_datasets]]
+          binding = "USAGE_ANALYTICS"
+          dataset = "ai_gateway_usage"
+
           [vars]
-          ADMIN_USERNAME = ${{ vars.ADMIN_USERNAME }}
-          ADMIN_PASSWORD = ${{ vars.ADMIN_PASSWORD }}
+          USAGE_ANALYTICS_DATASET = "ai_gateway_usage"
+          CF_ACCOUNT_ID = "$CF_ACCOUNT_ID"
+          ADMIN_USERNAME = "$ADMIN_USERNAME"
+          ADMIN_PASSWORD = "$ADMIN_PASSWORD"
           OPENCODE_MIRRORS_URL = "${MIRRORS_URL}"
           EOF
 
@@ -63,3 +74,8 @@ jobs:
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
+
+      - name: Configure Analytics query secret
+        env:
+          ANALYTICS_QUERY_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: printf '%s' "$ANALYTICS_QUERY_TOKEN" | npx wrangler secret put CF_API_TOKEN --name ai-gateway
