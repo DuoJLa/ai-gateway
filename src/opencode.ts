@@ -15,6 +15,7 @@ interface OpenCodeRequestOptions {
   body?: string
   fetcher?: typeof fetch
   random?: () => number
+  onAttempt?: (attemptNumber: number) => void
 }
 
 interface StoredFailure {
@@ -139,11 +140,14 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
   let officialFailure: StoredFailure | null = null
   let mirrorFailure: StoredFailure | null = null
   let lastTransportError: unknown = null
+  let attemptNumber = 0
 
   const enabledKeys = options.apiKeys.filter((entry) => entry.enabled && entry.key)
   const officialUrl = buildUrl(options.baseUrl, options.subPath, options.search)
 
   for (const entry of enabledKeys) {
+    attemptNumber++
+    options.onAttempt?.(attemptNumber)
     try {
       const response = await requestUpstream(
         fetcher,
@@ -164,6 +168,8 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
   }
 
   for (const mirror of getMirrorOrder(options.mirrorUrls, random)) {
+    attemptNumber++
+    options.onAttempt?.(attemptNumber)
     try {
       const response = await requestUpstream(
         fetcher,

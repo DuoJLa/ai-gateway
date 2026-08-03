@@ -103,17 +103,13 @@ export async function updateProxyKey(env: Env, id: string, updates: Partial<Prox
   return keys[idx]
 }
 
-export async function validateProxyKey(env: Env, key: string): Promise<boolean> {
+export async function getValidProxyKey(env: Env, key: string): Promise<ProxyKey | null> {
   const keys = await getProxyKeys(env)
-  return keys.some((k) => {
-    if (k.key !== key || !k.enabled) return false
-    if (k.expiresAt) {
-      const now = Date.now()
-      const expires = new Date(k.expiresAt).getTime()
-      if (now >= expires) return false
-    }
+  return keys.find((item) => {
+    if (item.key !== key || !item.enabled) return false
+    if (item.expiresAt && Date.now() >= new Date(item.expiresAt).getTime()) return false
     return true
-  })
+  }) ?? null
 }
 
 // ===== 初始数据填充 =====

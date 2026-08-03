@@ -76,7 +76,30 @@ export interface ApiResponse<T = unknown> {
 
 export interface Env {
   KV: KVNamespace
+  USAGE_ANALYTICS?: AnalyticsEngineDatasetBinding
+  USAGE_ANALYTICS_DATASET?: string
+  CF_ACCOUNT_ID?: string
+  CF_API_TOKEN?: string
   ADMIN_USERNAME?: string
   ADMIN_PASSWORD?: string
   OPENCODE_MIRRORS_URL?: string
+}
+
+export interface AnalyticsEngineDatasetBinding {
+  writeDataPoint(point: {
+    indexes?: string[]
+    blobs?: string[]
+    doubles?: number[]
+  }): void
+}
+
+export interface AppVariables {
+  username?: string
+  proxyKey?: ProxyKey
+  proxyKeyHash?: string
+}
+
+export type AppEnv = {
+  Bindings: Env
+  Variables: AppVariables
 }

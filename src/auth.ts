@@ -1,8 +1,8 @@
 import { Context, Next } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
-import { createSession, getSession, deleteSession, validateProxyKey } from './storage'
+import { createSession, getSession, deleteSession, getValidProxyKey } from './storage'
 import { SESSION_TTL } from './config'
-import type { Env } from './types'
+import type { AppEnv, Env } from './types'
 
 /** SHA-256 哈希 */
 export async function hashPassword(password: string): Promise<string> {
@@ -14,7 +14,7 @@ export async function hashPassword(password: string): Promise<string> {
 }
 
 /** 管理后台 Session 验证中间件 */
-export async function adminAuthMiddleware(c: Context<{ Bindings: Env }>, next: Next) {
+export async function adminAuthMiddleware(c: Context<AppEnv>, next: Next) {
   const sessionId = getCookie(c, 'session_id')
 
   if (!sessionId) {
@@ -36,7 +36,7 @@ export async function adminAuthMiddleware(c: Context<{ Bindings: Env }>, next: N
     return c.redirect('/admin/login')
   }
 
-  ;(c as any).set('username', session.username)
+  c.set('username', session.username)
   return next()
 }
 
@@ -91,7 +91,7 @@ export async function handleLogout(c: Context<{ Bindings: Env }>) {
 }
 
 /** 转发 API Key 验证中间件 */
-export async function proxyKeyAuthMiddleware(c: Context<{ Bindings: Env }>, next: Next) {
+export async function proxyKeyAuthMiddleware(c: Context<AppEnv>, next: Next) {
   const authHeader = c.req.header('Authorization')
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return c.json({
@@ -100,12 +100,15 @@ export async function proxyKeyAuthMiddleware(c: Context<{ Bindings: Env }>, next
   }
 
   const token = authHeader.slice(7)
-  const isValid = await validateProxyKey(c.env, token)
-  if (!isValid) {
+  const proxyKey = await getValidProxyKey(c.env, token)
+  if (!proxyKey) {
     return c.json({
       error: { message: 'API Key 无效或已禁用', type: 'authentication_error' },
     }, 401)
   }
 
+  // 中文说明：只把令牌对象和不可逆哈希放入请求上下文，观测层绝不持久化原始 sk_cf_*。
+  c.set('proxyKey', proxyKey)
+  c.set('proxyKeyHash', (await hashPassword(token)).slice(0, 32))
   return next()
 }

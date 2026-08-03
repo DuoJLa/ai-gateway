@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
-import type { Env } from './types'
+import type { AppEnv } from './types'
 import { adminAuthMiddleware, proxyKeyAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels } from './proxy'
 import {
@@ -20,8 +20,14 @@ import {
 } from './admin'
 import { renderHomePage, renderLoginPage, renderAdminPage } from './pages'
 import { seedInitialData, getSession } from './storage'
+import {
+  handleAnalyticsOverview,
+  handleAnalyticsTrend,
+  handleAnalyticsBreakdown,
+  handleUsageLogs,
+} from './analytics/admin-api'
 
-const app = new Hono<{ Bindings: Env }>()
+const app = new Hono<AppEnv>()
 
 // ===== 全局中间件 =====
 app.use('*', cors())
@@ -76,6 +82,12 @@ app.get('/admin/api/proxy-keys', handleGetProxyKeys)
 app.post('/admin/api/proxy-keys', handleCreateProxyKey)
 app.delete('/admin/api/proxy-keys/:id', handleDeleteProxyKey)
 app.patch('/admin/api/proxy-keys/:id', handleUpdateProxyKey)
+
+// Analytics Engine 总览与详细日志
+app.get('/admin/api/analytics/overview', handleAnalyticsOverview)
+app.get('/admin/api/analytics/trend', handleAnalyticsTrend)
+app.get('/admin/api/analytics/breakdown', handleAnalyticsBreakdown)
+app.get('/admin/api/usage-logs', handleUsageLogs)
 
 // ===== API 转发路由（需转发 Key 验证） =====
 app.use('/v1/*', proxyKeyAuthMiddleware)

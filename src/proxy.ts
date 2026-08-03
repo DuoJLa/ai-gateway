@@ -1,373 +1,251 @@
-import { Context } from 'hono'
+import type { Context } from 'hono'
 import { getProvider, getProviders } from './storage'
 import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
-import type { Env, ProxyRequestBody } from './types'
+import type { AppEnv, Env, Provider, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
-
-// ===== Key 健康状态类型和辅助函数 =====
+import { createAnalyticsContext, normalizeAnthropicUsage, normalizeChatUsage, normalizeResponsesUsage, summarizeError } from './analytics/types'
+import type { AnalyticsContext, UsageMetrics } from './analytics/types'
+import { observeStreamUsage, writeAnalyticsEvent } from './analytics/usage-logger'
 
 interface KeyHealth {
   failures: number
   lastFailed: boolean
-  demotedAt?: number  // 首次达到降权阈值的时间戳 (Date.now())
+  demotedAt?: number
 }
+
 type HealthMap = Record<string, KeyHealth>
 
-const HEALTH_KEY = (providerId: string) => KV_KEYS.KEY_HEALTH_PREFIX + providerId
+const HEALTH_KEY = (providerId: string): string => KV_KEYS.KEY_HEALTH_PREFIX + providerId
 
-async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
+const readHealth = async (env: Env, providerId: string): Promise<HealthMap> => {
   const raw = await env.KV.get(HEALTH_KEY(providerId))
   return raw ? JSON.parse(raw) : {}
 }
 
-async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
-  // 只保存有失败记录的 key，避免 KV 膨胀
+const writeHealth = async (env: Env, providerId: string, health: HealthMap): Promise<void> => {
   const filtered: HealthMap = {}
-  for (const [k, v] of Object.entries(health)) {
-    if (v.failures > 0) filtered[k] = v
+  for (const [key, value] of Object.entries(health)) {
+    if (value.failures > 0) filtered[key] = value
   }
-  if (Object.keys(filtered).length > 0) {
-    await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
-  } else {
-    // 全部健康，删除 KV 条目
-    await env.KV.delete(HEALTH_KEY(providerId)).catch(() => {})
-  }
+  if (Object.keys(filtered).length > 0) await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
+  else await env.KV.delete(HEALTH_KEY(providerId)).catch(() => undefined)
 }
 
-/** 解析模型 ID，如 "deepseek/deepseek-chat" → { providerId, modelId } */
-function parseModelId(model: string): { providerId: string; modelId: string } | null {
+const parseModelId = (model: string): { providerId: string; modelId: string } | null => {
   const slashIndex = model.indexOf('/')
-  if (slashIndex === -1) return null
-  return {
-    providerId: model.substring(0, slashIndex),
-    modelId: model.substring(slashIndex + 1),
+  if (slashIndex <= 0 || slashIndex === model.length - 1) return null
+  return { providerId: model.slice(0, slashIndex), modelId: model.slice(slashIndex + 1) }
+}
+
+const isStreamRequest = (body: ProxyRequestBody): boolean => body.stream === true
+const getRoute = (url: URL): string => url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
+
+const normalizeUsage = (route: string, provider: Provider, payload: unknown): UsageMetrics | null => {
+  if (route === 'responses') return normalizeResponsesUsage(payload)
+  if (route === 'messages' || provider.apiType === 'anthropic') return normalizeAnthropicUsage(payload)
+  return normalizeChatUsage(payload)
+}
+
+const readErrorResponse = async (response: Response): Promise<{ payload: unknown; summary: string }> => {
+  const text = await response.text().catch(() => '')
+  try {
+    const payload: unknown = JSON.parse(text)
+    return { payload, summary: summarizeError(payload) }
+  } catch {
+    return { payload: { error: { message: text || `HTTP ${response.status}` } }, summary: summarizeError(text || `HTTP ${response.status}`) }
   }
 }
 
-/** 测试模型连接，发送最小请求验证 */
+const finalizeSuccessfulResponse = async (
+  c: Context<AppEnv>,
+  response: Response,
+  context: AnalyticsContext,
+  route: string,
+  provider: Provider,
+): Promise<Response> => {
+  const headers = new Headers(response.headers)
+  headers.set('Cache-Control', 'no-store')
+  if (!response.body) {
+    writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status })
+    return new Response(null, { status: response.status, statusText: response.statusText, headers })
+  }
+
+  const [clientStream, observerStream] = response.body.tee()
+  c.executionCtx.waitUntil((async () => {
+    let usage: UsageMetrics | undefined
+    if (context.streamMode === 'stream') {
+      await observeStreamUsage(observerStream, provider.apiType || 'openai', (value) => {
+        // 中文说明：Anthropic 将输入、输出用量拆在多个事件中，按最大值合并可避免后续事件覆盖输入 Token。
+        usage = usage ? {
+          promptTokens: Math.max(usage.promptTokens, value.promptTokens),
+          completionTokens: Math.max(usage.completionTokens, value.completionTokens),
+          cachedTokens: Math.max(usage.cachedTokens, value.cachedTokens),
+          totalTokens: Math.max(usage.totalTokens, value.totalTokens),
+        } : value
+      })
+    } else {
+      const contentType = headers.get('Content-Type') || ''
+      if (contentType.includes('json')) {
+        const observerResponse = new Response(observerStream, { headers })
+        const payload = await observerResponse.json().catch(() => null) as unknown
+        usage = normalizeUsage(route, provider, payload) || undefined
+      } else {
+        await observerStream.cancel()
+      }
+    }
+    writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
+  })().catch((error) => {
+    // 中文说明：解析失败仍记录成功请求，避免无 usage 或二进制响应从请求总量中消失。
+    writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status, errorSummary: summarizeError(error) })
+  }))
+
+  return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
+}
+
 export async function testModelConnection(
   baseUrl: string,
   apiKey: string,
   modelId: string,
-  apiType?: 'openai' | 'anthropic'
+  apiType?: 'openai' | 'anthropic',
 ): Promise<{ success: boolean; message: string; statusCode?: number }> {
   try {
-    const cleanBase = baseUrl.replace(/\/$/, '')
-    const endpoint = apiType === 'anthropic' ? 'messages' : 'chat/completions'
-    const url = `${cleanBase}/${endpoint}`
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
+    const url = `${baseUrl.replace(/\/$/, '')}/${apiType === 'anthropic' ? 'messages' : 'chat/completions'}`
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (apiType === 'anthropic') {
       headers['x-api-key'] = apiKey
       headers['anthropic-version'] = '2023-06-01'
-    } else {
-      headers['Authorization'] = `Bearer ${apiKey}`
-    }
-
+    } else headers.Authorization = `Bearer ${apiKey}`
     const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: modelId,
-        messages: [{ role: 'user', content: 'hi' }],
-        max_tokens: 1,
-      }),
-      signal: AbortSignal.timeout(15000),
+      method: 'POST', headers, body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }), signal: AbortSignal.timeout(15000),
     })
-
-    if (response.ok) {
-      return { success: true, message: '连接成功', statusCode: response.status }
-    }
-
-    let errorBody = ''
-    try {
-      const errorData = await response.json() as { error?: { message?: string } }
-      errorBody = errorData?.error?.message || JSON.stringify(errorData)
-    } catch {
-      errorBody = await response.text()
-    }
-
-    return {
-      success: false,
-      message: `HTTP ${response.status}: ${errorBody.substring(0, 200)}`,
-      statusCode: response.status,
-    }
-  } catch (err) {
-    const error = err as Error
-    return {
-      success: false,
-      message: `连接失败: ${error.message?.substring(0, 200) || '未知错误'}`,
-    }
+    if (response.ok) return { success: true, message: '连接成功', statusCode: response.status }
+    const failure = await readErrorResponse(response)
+    return { success: false, message: `HTTP ${response.status}: ${failure.summary}`, statusCode: response.status }
+  } catch (error) {
+    return { success: false, message: `连接失败: ${summarizeError(error)}` }
   }
 }
 
-/** 处理 /v1/chat/completions 等 API 转发 */
-export async function handleProxy(c: Context<{ Bindings: Env }>) {
+export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
+  const url = new URL(c.req.url)
+  const route = getRoute(url)
+  const proxyKey = c.get('proxyKey') || null
+  const proxyKeyHash = c.get('proxyKeyHash') || ''
+  let context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, '', 'sync')
+
+  const fail = (status: number, code: string, message: string, payload?: unknown): Response => {
+    writeAnalyticsEvent(c, { context, result: 'failure', upstreamStatus: status, errorCode: code, errorSummary: message })
+    return new Response(JSON.stringify(payload || { error: { message, type: code } }), {
+      status,
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    })
+  }
+
   try {
     const body = await c.req.json<ProxyRequestBody>()
-    const model = body.model
-
-    if (!model) {
-      return c.json({ error: { message: '缺少 model 参数', type: 'invalid_request_error' } }, 400)
-    }
+    const model = body.model || ''
+    context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, isStreamRequest(body) ? 'stream' : 'sync')
+    if (!model) return fail(400, 'invalid_request_error', '缺少 model 参数')
 
     const parsed = parseModelId(model)
-    if (!parsed) {
-      return c.json({
-        error: {
-          message: `模型格式错误 "${model}"，请使用 提供商ID/模型ID 格式`,
-          type: 'invalid_request_error',
-        },
-      }, 400)
-    }
-
-    const { providerId, modelId } = parsed
-    const provider = await getProvider(c.env, providerId)
-
+    if (!parsed) return fail(400, 'invalid_request_error', `模型格式错误 "${model}"，请使用 提供商ID/模型ID 格式`)
+    const provider = await getProvider(c.env, parsed.providerId)
     if (!provider) {
-      return c.json({
-        error: { message: `提供商 "${providerId}" 不存在`, type: 'invalid_request_error' },
-      }, 404)
+      context.providerId = parsed.providerId
+      return fail(404, 'invalid_request_error', `提供商 "${parsed.providerId}" 不存在`)
     }
 
-    if (!provider.enabled) {
-      return c.json({
-        error: { message: `提供商 "${provider.name}" 已禁用`, type: 'provider_disabled' },
-      }, 403)
+    context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, isStreamRequest(body) ? 'stream' : 'sync', provider, parsed.modelId)
+    if (!provider.enabled) return fail(403, 'provider_disabled', `提供商 "${provider.name}" 已禁用`)
+    const modelConfig = provider.models.find((item) => item.id === parsed.modelId)
+    if (!modelConfig) return fail(404, 'invalid_request_error', `模型 "${parsed.modelId}" 未在提供商 "${provider.name}" 中配置`)
+    if (!modelConfig.enabled) return fail(403, 'model_disabled', `模型 "${parsed.modelId}" 已禁用`)
+
+    const enabledKeys = provider.apiKeys.filter((entry) => entry.enabled)
+    const forwardBody = { ...body, model: parsed.modelId }
+    if (isOpenCodeProvider(provider.id)) {
+      const response = await proxyOpenCodeRequest({ baseUrl: provider.baseUrl, apiKeys: enabledKeys, method: c.req.method, subPath: route, search: url.search, body: JSON.stringify(forwardBody), mirrorUrls: resolveOpenCodeUrls(c.env), onAttempt: (attemptNumber) => { context.retryCount = Math.max(0, attemptNumber - 1) } })
+      if (response.ok) return finalizeSuccessfulResponse(c, response, context, route, provider)
+      const failure = await readErrorResponse(response)
+      return fail(response.status, `http_${response.status}`, failure.summary, failure.payload)
     }
 
-    const modelConfig = provider.models.find((m) => m.id === modelId)
-    if (!modelConfig) {
-      return c.json({
-        error: { message: `模型 "${modelId}" 未在提供商 "${provider.name}" 中配置`, type: 'invalid_request_error' },
-      }, 404)
-    }
-    if (!modelConfig.enabled) {
-      return c.json({
-        error: { message: `模型 "${modelId}" 已禁用`, type: 'model_disabled' },
-      }, 403)
-    }
-
-    const enabledKeys = provider.apiKeys.filter(k => k.enabled)
-    const forwardBody = { ...body, model: modelId }
-    const url = new URL(c.req.url)
-    const subPath = url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
-
-    if (isOpenCodeProvider(providerId)) {
-      const response = await proxyOpenCodeRequest({
-        baseUrl: provider.baseUrl,
-        apiKeys: enabledKeys,
-        method: c.req.method,
-        subPath,
-        search: url.search,
-        body: JSON.stringify(forwardBody),
-        mirrorUrls: resolveOpenCodeUrls(c.env),
-      })
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-      })
-    }
-
-    if (enabledKeys.length === 0) {
-      return c.json({
-        error: { message: `提供商 "${provider.name}" 未配置可用的 API Key`, type: 'configuration_error' },
-      }, 500)
-    }
-
-    const cleanBase = provider.baseUrl.replace(/\/$/, '')
-    const forwardUrl = `${cleanBase}/${subPath}${url.search}`
-
-    // 按健康状态排序 key：健康→洗牌，不健康→末尾，冷却到期→试用，连续失败3次→降权排除
-    const healthData = await readHealth(c.env, providerId)
+    if (enabledKeys.length === 0) return fail(500, 'configuration_error', `提供商 "${provider.name}" 未配置可用的 API Key`)
+    const healthData = await readHealth(c.env, provider.id)
     const healthy: number[] = []
     const unhealthy: number[] = []
     const probation: number[] = []
     const demoted: number[] = []
-
-    if (enabledKeys.length === 1) {
-      // 只有一个 key，跳过健康检查，直接使用
-      healthy.push(0)
-    } else {
-      for (let i = 0; i < enabledKeys.length; i++) {
-        const h = healthData[enabledKeys[i].key]
-        if (h && h.failures >= KEY_HEALTH_MAX_FAILURES) {
-          // 兼容旧数据：无 demotedAt 视为现在刚降权，统一走冷却逻辑
-          if (!h.demotedAt) {
-            h.demotedAt = Date.now()
-          }
-          if (Date.now() - h.demotedAt >= KEY_HEALTH_COOLDOWN_MS) {
-            probation.push(i)  // 冷却到期，进入试用组
-          } else {
-            demoted.push(i)    // 仍在冷却，继续保持降权
-          }
-        } else if (h && h.lastFailed) {
-          unhealthy.push(i)
-        } else {
-          healthy.push(i)
-        }
-      }
+    if (enabledKeys.length === 1) healthy.push(0)
+    else enabledKeys.forEach((entry, index) => {
+      const health = healthData[entry.key]
+      if (health?.failures >= KEY_HEALTH_MAX_FAILURES) {
+        if (!health.demotedAt) health.demotedAt = Date.now()
+        if (Date.now() - health.demotedAt >= KEY_HEALTH_COOLDOWN_MS) probation.push(index)
+        else demoted.push(index)
+      } else if (health?.lastFailed) unhealthy.push(index)
+      else healthy.push(index)
+    })
+    for (let index = healthy.length - 1; index > 0; index--) {
+      const target = Math.floor(Math.random() * (index + 1)); [healthy[index], healthy[target]] = [healthy[target], healthy[index]]
     }
-
-    // Fisher-Yates 洗牌（仅健康 key）
-    for (let i = healthy.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [healthy[i], healthy[j]] = [healthy[j], healthy[i]]
-    }
-
     const keyOrder = [...healthy, ...unhealthy, ...probation]
+    if (!keyOrder.length) keyOrder.push(...demoted)
 
-    // 所有 key 都在冷却中时，降级尝试 demoted key（修复旧数据缺失 demotedAt 的死循环）
-    if (keyOrder.length === 0 && demoted.length > 0) {
-      keyOrder.push(...demoted)
-      console.log(`[proxy] ${providerId}: all keys demoted, falling back to ${demoted.length} key(s)`)
-    }
-
-    if (demoted.length > 0 || probation.length > 0) {
-      console.log(`[proxy] ${providerId}: ${demoted.length} key(s) demoted, ${probation.length} key(s) on probation (cooldown expired)`)
-    }
-
-    let lastError: Response | null = null
+    let lastStatus = 0
+    let lastSummary = '没有可用的 API Key'
     let healthUpdated = false
-
-    for (const keyIndex of keyOrder) {
-      const apiKey = enabledKeys[keyIndex].key
+    for (let attempt = 0; attempt < keyOrder.length; attempt++) {
+      if (attempt > 0) context.retryCount++
+      const apiKey = enabledKeys[keyOrder[attempt]].key
       try {
-        const forwardHeaders: Record<string, string> = {
-          'Content-Type': 'application/json',
-        }
-        if (provider.apiType === 'anthropic') {
-          forwardHeaders['x-api-key'] = apiKey
-          forwardHeaders['anthropic-version'] = '2023-06-01'
-        } else {
-          forwardHeaders['Authorization'] = `Bearer ${apiKey}`
-        }
-
-        const response = await fetch(forwardUrl, {
-          method: c.req.method,
-          headers: forwardHeaders,
-          body: JSON.stringify(forwardBody),
-          signal: AbortSignal.timeout(60000),
-        })
-
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+        if (provider.apiType === 'anthropic') { headers['x-api-key'] = apiKey; headers['anthropic-version'] = '2023-06-01' }
+        else headers.Authorization = `Bearer ${apiKey}`
+        const response = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/${route}${url.search}`, { method: c.req.method, headers, body: JSON.stringify(forwardBody), signal: AbortSignal.timeout(60000) })
+        lastStatus = response.status
         if (response.ok) {
-          // 成功：重置健康状态
-          if (healthData[apiKey]?.failures > 0) {
-            delete healthData[apiKey]
-            healthUpdated = true
-          }
-          if (healthUpdated) await writeHealth(c.env, providerId, healthData)
-
-          const responseHeaders: Record<string, string> = {
-            'Content-Type': response.headers.get('Content-Type') || 'application/json',
-            'Cache-Control': 'no-store',
-          }
-          return new Response(response.body, {
-            status: response.status,
-            headers: responseHeaders,
-          })
+          if (healthData[apiKey]?.failures) { delete healthData[apiKey]; healthUpdated = true }
+          if (healthUpdated) await writeHealth(c.env, provider.id, healthData)
+          return finalizeSuccessfulResponse(c, response, context, route, provider)
         }
-
-        // 429 限流：跳过当前 key，不标记失败
-        if (response.status === 429) {
-          lastError = response
-          continue
+        const failure = await readErrorResponse(response)
+        lastSummary = failure.summary
+        if (response.status !== 429 && (response.status === 401 || response.status === 403 || response.status >= 500)) {
+          const health = healthData[apiKey] || { failures: 0, lastFailed: false }
+          health.failures++; health.lastFailed = true
+          if (health.failures >= KEY_HEALTH_MAX_FAILURES) health.demotedAt = Date.now()
+          healthData[apiKey] = health; healthUpdated = true
         }
-
-        // 401/403/5xx 尝试下一个 key（标记失败）
-        if (response.status === 401 || response.status === 403 || response.status >= 500) {
-          const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-          h.failures++
-          h.lastFailed = true
-          if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
-            h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
-          }
-          healthData[apiKey] = h
-          healthUpdated = true
-          lastError = response
-          continue
+        if (![401, 403, 429].includes(response.status) && response.status < 500) {
+          if (healthUpdated) await writeHealth(c.env, provider.id, healthData)
+          return fail(response.status, `http_${response.status}`, failure.summary, failure.payload)
         }
-
-        // 其他错误（400/404 等）直接返回
-        const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
-        return c.json(errorData, response.status as Parameters<typeof c.json>[1])
-      } catch (err) {
-        const error = err as Error
-        // 网络错误也标记为失败
-        const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-        h.failures++
-        h.lastFailed = true
-        if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
-          h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
-        }
-        healthData[apiKey] = h
-        healthUpdated = true
-        lastError = new Response(JSON.stringify({
-          error: { message: error.message || '请求失败', type: 'proxy_error' },
-        }), { status: 502 })
-        continue
+      } catch (error) {
+        lastStatus = 502
+        lastSummary = summarizeError(error)
+        const health = healthData[apiKey] || { failures: 0, lastFailed: false }
+        health.failures++; health.lastFailed = true
+        if (health.failures >= KEY_HEALTH_MAX_FAILURES) health.demotedAt = Date.now()
+        healthData[apiKey] = health; healthUpdated = true
       }
     }
-
-    // 写回健康状态
-    if (healthUpdated) await writeHealth(c.env, providerId, healthData)
-
-    // 所有 key 均失败
-    if (lastError) {
-      const errorBody = await lastError.text().catch(() => '所有 API Key 均失败')
-      return c.json({
-        error: {
-          message: `所有 API Key 已用完，最后一次错误: HTTP ${lastError.status}`,
-          type: 'key_exhausted',
-          detail: errorBody.substring(0, 500),
-        },
-      }, (lastError.status || 502) as Parameters<typeof c.json>[1])
-    }
-
-    return c.json({
-      error: { message: '没有可用的 API Key', type: 'configuration_error' },
-    }, 500)
-  } catch (err) {
-    const error = err as Error
-    return c.json({
-      error: { message: error.message || '代理转发内部错误', type: 'server_error' },
-    }, 500)
+    if (healthUpdated) await writeHealth(c.env, provider.id, healthData)
+    return fail(lastStatus || 502, 'key_exhausted', `所有 API Key 已用完，最后一次错误：${lastSummary}`)
+  } catch (error) {
+    return fail(500, 'server_error', summarizeError(error))
   }
 }
 
-/** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀） */
-export async function handleModels(c: Context<{ Bindings: Env }>) {
+export async function handleModels(c: Context<AppEnv>): Promise<Response> {
   const providers = await getProviders(c.env)
-
-  const models: Array<{
-    id: string
-    provider: string
-    provider_name: string
-    object: string
-    created: number
-    owned_by: string
-  }> = []
-
+  const models: Array<{ id: string; provider: string; provider_name: string; object: string; created: number; owned_by: string }> = []
   for (const provider of providers) {
     if (!provider.enabled) continue
     for (const model of provider.models) {
       if (!model.enabled) continue
-      models.push({
-        id: `${provider.id}/${model.id}`,
-        provider: provider.id,
-        provider_name: provider.name,
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: provider.id,
-      })
+      models.push({ id: `${provider.id}/${model.id}`, provider: provider.id, provider_name: provider.name, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: provider.id })
     }
   }
-
-  return c.json({
-    object: 'list',
-    data: models,
-  })
+  return c.json({ object: 'list', data: models })
 }
