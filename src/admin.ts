@@ -14,7 +14,7 @@ import { testModelConnection } from './proxy'
 import { fetchOpenCodeModels, isOpenCodeProvider, resolveOpenCodeUrls, testOpenCodeModel } from './opencode'
 import { PROXY_KEY_PREFIX, EXPIRY_OPTIONS, OPENCODE_DEFAULT_URL } from './config'
 import type {
-  Env,
+  AppEnv,
   ApiResponse,
   Provider,
   CreateProviderRequest,
@@ -40,7 +40,7 @@ function normalizeArray<T>(
   return items as T[]
 }
 
-export async function handleStatus(c: Context<{ Bindings: Env }>) {
+export async function handleStatus(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
 
@@ -66,12 +66,12 @@ export async function handleStatus(c: Context<{ Bindings: Env }>) {
 
 // ===== 提供商 CRUD =====
 
-export async function handleGetProviders(c: Context<{ Bindings: Env }>) {
+export async function handleGetProviders(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   return c.json<ApiResponse<Provider[]>>({ success: true, data: providers })
 }
 
-export async function handleCreateProvider(c: Context<{ Bindings: Env }>) {
+export async function handleCreateProvider(c: Context<AppEnv>) {
   const body = await c.req.json<CreateProviderRequest>()
   // opencode 未传地址时自动填充
   if (body.id === 'opencode' && !body.baseUrl) {
@@ -106,7 +106,7 @@ apiKeys: normalizeArray(body.apiKeys, (k) => ({ key: k, enabled: true })),
   return c.json<ApiResponse<Provider>>({ success: true, data: provider }, 201)
 }
 
-export async function handleUpdateProvider(c: Context<{ Bindings: Env }>) {
+export async function handleUpdateProvider(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const body = await c.req.json<UpdateProviderRequest>()
@@ -131,7 +131,7 @@ if (body.apiKeys !== undefined) {
   return c.json<ApiResponse<Provider>>({ success: true, data: updated })
 }
 
-export async function handleDeleteProvider(c: Context<{ Bindings: Env }>) {
+export async function handleDeleteProvider(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const deleted = await deleteProvider(c.env, id)
@@ -141,7 +141,7 @@ export async function handleDeleteProvider(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({ success: true, message: '提供商已删除' })
 }
 
-export async function handleTestModel(c: Context<{ Bindings: Env }>) {
+export async function handleTestModel(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const { modelId } = await c.req.json<TestModelRequest>()
@@ -184,7 +184,7 @@ function buildAuthHeaders(apiKey: string, apiType?: string): Record<string, stri
   return { 'Authorization': `Bearer ${apiKey}` }
 }
 
-export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
+export async function handleTestKeyNew(c: Context<AppEnv>) {
   const { url, apiKey, apiType, providerId } = await c.req.json<{
     url: string
     apiKey: string
@@ -241,7 +241,7 @@ export async function handleTestKeyNew(c: Context<{ Bindings: Env }>) {
   }
 }
 
-export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
+export async function handleTestModelNew(c: Context<AppEnv>) {
   const { url, apiKey, apiType, model, providerId } = await c.req.json<{
     url: string
     apiKey: string
@@ -287,7 +287,7 @@ export async function handleTestModelNew(c: Context<{ Bindings: Env }>) {
 
 // ===== 转发 Key 管理 =====
 
-export async function handleGetProxyKeys(c: Context<{ Bindings: Env }>) {
+export async function handleGetProxyKeys(c: Context<AppEnv>) {
   const keys = await getProxyKeys(c.env)
   const maskedKeys = keys.map((k) => ({
     ...k,
@@ -298,7 +298,7 @@ export async function handleGetProxyKeys(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({ success: true, data: maskedKeys })
 }
 
-export async function handleCreateProxyKey(c: Context<{ Bindings: Env }>) {
+export async function handleCreateProxyKey(c: Context<AppEnv>) {
   const body = await c.req.json<CreateProxyKeyRequest>()
   const id = crypto.randomUUID()
   const randomPart = crypto.randomUUID().replace(/-/g, '')
@@ -330,7 +330,7 @@ export async function handleCreateProxyKey(c: Context<{ Bindings: Env }>) {
   }, 201)
 }
 
-export async function handleDeleteProxyKey(c: Context<{ Bindings: Env }>) {
+export async function handleDeleteProxyKey(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const deleted = await deleteProxyKey(c.env, id)
@@ -340,7 +340,7 @@ export async function handleDeleteProxyKey(c: Context<{ Bindings: Env }>) {
   return c.json<ApiResponse>({ success: true, message: '转发 Key 已删除' })
 }
 
-export async function handleUpdateProxyKey(c: Context<{ Bindings: Env }>) {
+export async function handleUpdateProxyKey(c: Context<AppEnv>) {
   const id = c.req.param('id')
   if (!id) return c.json<ApiResponse>({ success: false, message: '缺少 id 参数' }, 400)
   const body = await c.req.json<{ enabled?: boolean }>()
