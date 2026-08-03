@@ -77,5 +77,8 @@ jobs:
 
       - name: Configure Analytics query secret
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           ANALYTICS_QUERY_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        # 中文说明：wrangler-action 的 with 参数不会传递给后续 shell，需显式提供 Wrangler 标准认证变量。
         run: printf '%s' "$ANALYTICS_QUERY_TOKEN" | npx wrangler secret put CF_API_TOKEN --name ai-gateway
