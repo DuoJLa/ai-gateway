@@ -44,6 +44,8 @@ const FILTER_FIELDS: Record<UsageLogDimension, string> = {
 const getRange = (value?: string): AnalyticsRange => value && value in RANGE_SQL ? value as AnalyticsRange : '24h'
 const getDataset = (env: Env): string => env.USAGE_ANALYTICS_DATASET && /^[A-Za-z_][A-Za-z0-9_]*$/.test(env.USAGE_ANALYTICS_DATASET) ? env.USAGE_ANALYTICS_DATASET : 'ai_gateway_usage'
 const escapeSql = (value: string): string => value.replace(/'/g, "''")
+// 中文说明：Analytics Engine SQL 不支持除零保护函数；与原项目一致直接用采样总量作除数，空结果由响应归一化为 0。
+const AVG_LATENCY_SQL = `sum(${ANALYTICS_DOUBLES.latencyMs} * _sample_interval) / sum(_sample_interval)`
 
 export class AnalyticsQueryError extends Error {
   public readonly statusCode: number
@@ -95,7 +97,7 @@ const queryAnalytics = async (c: Context<AppEnv>, sql: string): Promise<Analytic
 
 export const queryUsageOverview = async (c: Context<AppEnv>, rangeValue?: string): Promise<Record<string, number>> => {
   const range = RANGE_SQL[getRange(rangeValue)]
-  const sql = `SELECT sum(_sample_interval) AS requests, sum(${ANALYTICS_DOUBLES.successFlag} * _sample_interval) AS successes, sum(${ANALYTICS_DOUBLES.promptTokens} * _sample_interval) AS prompt_tokens, sum(${ANALYTICS_DOUBLES.completionTokens} * _sample_interval) AS completion_tokens, sum(${ANALYTICS_DOUBLES.cachedTokens} * _sample_interval) AS cached_tokens, sum(${ANALYTICS_DOUBLES.totalTokens} * _sample_interval) AS total_tokens, sum(${ANALYTICS_DOUBLES.latencyMs} * _sample_interval) / nullIf(sum(_sample_interval), 0) AS avg_latency_ms FROM ${getDataset(c.env)} WHERE timestamp >= NOW() - ${range.lookback}`
+  const sql = `SELECT sum(_sample_interval) AS requests, sum(${ANALYTICS_DOUBLES.successFlag} * _sample_interval) AS successes, sum(${ANALYTICS_DOUBLES.promptTokens} * _sample_interval) AS prompt_tokens, sum(${ANALYTICS_DOUBLES.completionTokens} * _sample_interval) AS completion_tokens, sum(${ANALYTICS_DOUBLES.cachedTokens} * _sample_interval) AS cached_tokens, sum(${ANALYTICS_DOUBLES.totalTokens} * _sample_interval) AS total_tokens, ${AVG_LATENCY_SQL} AS avg_latency_ms FROM ${getDataset(c.env)} WHERE timestamp >= NOW() - ${range.lookback}`
   const row = (await queryAnalytics(c, sql)).data[0] || {}
   const requests = Number(row.requests || 0)
   const successes = Number(row.successes || 0)
@@ -104,7 +106,7 @@ export const queryUsageOverview = async (c: Context<AppEnv>, rangeValue?: string
 
 export const queryUsageTrend = async (c: Context<AppEnv>, rangeValue?: string): Promise<Array<Record<string, unknown>>> => {
   const range = RANGE_SQL[getRange(rangeValue)]
-  const sql = `SELECT toStartOfInterval(timestamp, ${range.bucket}) AS bucket, sum(_sample_interval) AS requests, sum(${ANALYTICS_DOUBLES.successFlag} * _sample_interval) AS successes, sum(${ANALYTICS_DOUBLES.promptTokens} * _sample_interval) AS prompt_tokens, sum(${ANALYTICS_DOUBLES.completionTokens} * _sample_interval) AS completion_tokens, sum(${ANALYTICS_DOUBLES.latencyMs} * _sample_interval) / nullIf(sum(_sample_interval), 0) AS avg_latency_ms FROM ${getDataset(c.env)} WHERE timestamp >= NOW() - ${range.lookback} GROUP BY bucket ORDER BY bucket ASC`
+  const sql = `SELECT toStartOfInterval(timestamp, ${range.bucket}) AS bucket, sum(_sample_interval) AS requests, sum(${ANALYTICS_DOUBLES.successFlag} * _sample_interval) AS successes, sum(${ANALYTICS_DOUBLES.promptTokens} * _sample_interval) AS prompt_tokens, sum(${ANALYTICS_DOUBLES.completionTokens} * _sample_interval) AS completion_tokens, ${AVG_LATENCY_SQL} AS avg_latency_ms FROM ${getDataset(c.env)} WHERE timestamp >= NOW() - ${range.lookback} GROUP BY bucket ORDER BY bucket ASC`
   return (await queryAnalytics(c, sql)).data
 }
 
@@ -116,7 +118,7 @@ export const queryUsageBreakdown = async (c: Context<AppEnv>, rangeValue: string
     ? `${field} AS label, ${ANALYTICS_BLOBS.providerName} AS name`
     : `${field} AS label`
   const groupFields = dimension === 'channel' ? `${field}, ${ANALYTICS_BLOBS.providerName}` : field
-  const sql = `SELECT ${identitySelect}, sum(_sample_interval) AS requests, sum(${ANALYTICS_DOUBLES.successFlag} * _sample_interval) AS successes, sum(${ANALYTICS_DOUBLES.promptTokens} * _sample_interval) AS prompt_tokens, sum(${ANALYTICS_DOUBLES.completionTokens} * _sample_interval) AS completion_tokens, sum(${ANALYTICS_DOUBLES.latencyMs} * _sample_interval) / nullIf(sum(_sample_interval), 0) AS avg_latency_ms FROM ${getDataset(c.env)} WHERE timestamp >= NOW() - ${range.lookback} GROUP BY ${groupFields} ORDER BY requests DESC LIMIT 12`
+  const sql = `SELECT ${identitySelect}, sum(_sample_interval) AS requests, sum(${ANALYTICS_DOUBLES.successFlag} * _sample_interval) AS successes, sum(${ANALYTICS_DOUBLES.promptTokens} * _sample_interval) AS prompt_tokens, sum(${ANALYTICS_DOUBLES.completionTokens} * _sample_interval) AS completion_tokens, ${AVG_LATENCY_SQL} AS avg_latency_ms FROM ${getDataset(c.env)} WHERE timestamp >= NOW() - ${range.lookback} GROUP BY ${groupFields} ORDER BY requests DESC LIMIT 12`
   return (await queryAnalytics(c, sql)).data
 }
 
