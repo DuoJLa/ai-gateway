@@ -1,9 +1,10 @@
 import { Context } from 'hono'
 import { getProviders, getProxyKeys } from './storage'
 import { SITE_CONFIG, OPENCODE_DEFAULT_URL } from './config'
-import type { Env } from './types'
+import type { AppEnv } from './types'
 import { CSS_CONTENT } from './pages.css'
 import { SHARED_JS, renderSiteFooter } from './shared.js'
+import { ANALYTICS_JS } from './analytics-ui.js'
 
 // 前端页面模板：仅重构视觉与交互，保持后端路由、KV 结构和 API 契约不变。
 const escapePageHtml = (value: unknown) => String(value ?? '')
@@ -29,7 +30,7 @@ const H = (title: string) => `
 
 // ===== 首页 =====
 
-export async function renderHomePage(c: Context<{ Bindings: Env }>, isLoggedIn: boolean) {
+export async function renderHomePage(c: Context<AppEnv>, isLoggedIn: boolean) {
   const providers = await getProviders(c.env)
   const host = c.req.header('host') || 'localhost:8787'
   const apiBase = `https://${host}/v1`
@@ -184,7 +185,7 @@ ${renderSiteFooter(SITE_CONFIG.title)}
 
 // ===== 登录页 =====
 
-export async function renderLoginPage(c: Context<{ Bindings: Env }>) {
+export async function renderLoginPage(c: Context<AppEnv>) {
   return c.html(`<!DOCTYPE html><html lang="zh-CN">
 ${H('登录')}
 <body class="site-page auth-page">
@@ -297,7 +298,7 @@ ${H('登录')}
 
 // ===== 管理后台 =====
 
-export async function renderAdminPage(c: Context<{ Bindings: Env }>) {
+export async function renderAdminPage(c: Context<AppEnv>) {
   const providers = await getProviders(c.env)
   const proxyKeys = await getProxyKeys(c.env)
   const enabledProvidersCount = providers.filter((provider) => provider.enabled).length
@@ -316,6 +317,8 @@ ${H('管理')}
     </a>
     <nav class="admin-nav">
       <a class="admin-nav__link is-active" href="#overview"><i class="fas fa-chart-pie" aria-hidden="true"></i><span>概览</span></a>
+      <a class="admin-nav__link" href="#analytics"><i class="fas fa-chart-line" aria-hidden="true"></i><span>使用统计</span></a>
+      <a class="admin-nav__link" href="#usage-logs"><i class="fas fa-list-alt" aria-hidden="true"></i><span>详细日志</span></a>
       <a class="admin-nav__link" href="#providers"><i class="fas fa-server" aria-hidden="true"></i><span>提供商</span><b>${providers.length}</b></a>
       <a class="admin-nav__link" href="#proxy-keys"><i class="fas fa-key" aria-hidden="true"></i><span>转发 Key</span><b>${proxyKeys.length}</b></a>
     </nav>
@@ -328,7 +331,7 @@ ${H('管理')}
   <div class="admin-main">
     <header class="admin-topbar">
       <a class="brand" href="/"><span class="brand__mark" aria-hidden="true"><i class="fas fa-cloud"></i></span><span class="brand__name">${SITE_CONFIG.title}</span></a>
-      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a></nav>
+      <nav aria-label="移动端控制台导航"><a href="#overview">概览</a><a href="#analytics">统计</a><a href="#usage-logs">日志</a><a href="#providers">提供商</a><a href="#proxy-keys">Key</a></nav>
       <a class="icon-btn" href="/admin/logout" aria-label="退出登录"><i class="fas fa-sign-out-alt" aria-hidden="true"></i></a>
     </header>
 
@@ -346,6 +349,50 @@ ${H('管理')}
           <div><span>${proxyKeys.length}</span><p>转发 Key</p><small>${enabledProxyKeysCount} 个可用</small></div>
           <div><span class="status-dot status-dot--online"><i aria-hidden="true"></i>已配置</span><p>存储</p><small>Cloudflare KV</small></div>
         </div>
+      </section>
+
+      <section id="analytics" class="workspace-section analytics-section" aria-labelledby="analytics-title">
+        <div class="section-heading section-heading--admin">
+          <div><h2 id="analytics-title">使用统计</h2><p>查看请求、Token、延迟与模型、渠道调用分布。</p></div>
+          <div class="analytics-actions" role="group" aria-label="统计时间范围">
+            <button class="range-button is-active" type="button" data-analytics-range="24h" onclick="setAnalyticsRange('24h',this)">24 小时</button>
+            <button class="range-button" type="button" data-analytics-range="7d" onclick="setAnalyticsRange('7d',this)">7 天</button>
+            <button class="range-button" type="button" data-analytics-range="30d" onclick="setAnalyticsRange('30d',this)">30 天</button>
+            <button class="range-button" type="button" data-analytics-range="90d" onclick="setAnalyticsRange('90d',this)">90 天</button>
+            <button id="analytics-refresh" class="btn btn-s" type="button" onclick="loadAnalytics()"><span class="button-label"><i class="fas fa-sync-alt" aria-hidden="true"></i>刷新</span><span class="button-loading"><i class="fas fa-circle-notch fa-spin" aria-hidden="true"></i>加载中</span></button>
+          </div>
+        </div>
+        <div id="analytics-error" class="al al-e hd analytics-alert" role="alert" aria-live="polite"></div>
+        <div class="usage-metrics" aria-label="使用统计概览">
+          <article><span>请求总量</span><strong id="metric-requests" class="analytics-value">—</strong><small>最终客户端请求</small></article>
+          <article><span>成功率</span><strong id="metric-success" class="analytics-value">—</strong><small>最终 2xx 请求占比</small></article>
+          <article><span>输入 Token</span><strong id="metric-input" class="analytics-value">—</strong><small>统一协议口径</small></article>
+          <article><span>输出 Token</span><strong id="metric-output" class="analytics-value">—</strong><small>统一协议口径</small></article>
+          <article><span>平均延迟</span><strong id="metric-latency" class="analytics-value">—</strong><small>包含完整响应耗时</small></article>
+        </div>
+        <div class="analytics-panel trend-panel"><div class="analytics-panel__heading"><div><h3>请求趋势</h3><p>按所选时间范围聚合最终请求。</p></div><span class="chart-legend"><i></i>请求量</span></div><div id="analytics-trend" class="trend-canvas"><div class="analytics-empty"><p>正在加载趋势数据</p></div></div></div>
+        <div class="ranking-grid">
+          <section class="analytics-panel"><div class="analytics-panel__heading"><div><h3>模型调用排行</h3><p>按 provider/model 聚合。</p></div></div><div id="model-ranking" class="ranking-list"></div></section>
+          <section class="analytics-panel"><div class="analytics-panel__heading"><div><h3>渠道调用排行</h3><p>按 Provider 实例聚合。</p></div></div><div id="channel-ranking" class="ranking-list"></div></section>
+        </div>
+      </section>
+
+      <section id="usage-logs" class="workspace-section analytics-section" aria-labelledby="usage-logs-title">
+        <div class="section-heading section-heading--admin"><div><h2 id="usage-logs-title">详细日志</h2><p>筛选 Analytics Engine 请求事件并查看完整观测字段。</p></div></div>
+        <form class="log-filter" onsubmit="event.preventDefault();loadUsageLogs(true)">
+          <div><label for="log-start">开始时间</label><input id="log-start" type="datetime-local"></div>
+          <div><label for="log-end">结束时间</label><input id="log-end" type="datetime-local"></div>
+          <div><label for="log-dimension">筛选维度</label><select id="log-dimension"><option value="model">模型</option><option value="channel">渠道</option><option value="token">转发令牌</option><option value="route">接口路由</option><option value="provider">Provider 类型</option><option value="requestId">Request ID</option><option value="traceId">Trace ID</option><option value="clientIp">客户端 IP</option><option value="country">国家</option><option value="region">地区</option><option value="city">城市</option><option value="colo">Colo</option><option value="errorCode">错误代码</option><option value="errorSummary">错误摘要</option></select></div>
+          <div class="log-filter__keyword"><label for="log-keyword">关键词</label><input id="log-keyword" type="search" placeholder="输入筛选关键词"></div>
+          <div><label for="log-result">结果</label><select id="log-result"><option value="all">全部</option><option value="success">成功</option><option value="failure">失败</option></select></div>
+          <div class="log-filter__actions"><button class="btn btn-s" type="button" onclick="resetLogFilters()">重置</button><button class="btn btn-p" type="submit"><i class="fas fa-search" aria-hidden="true"></i>查询</button></div>
+        </form>
+        <div id="usage-log-error" class="al al-e hd analytics-alert" role="alert" aria-live="polite"></div>
+        <div class="log-table-wrap"><table class="log-table"><thead><tr><th>时间</th><th>结果</th><th>模型</th><th>渠道</th><th>输入 / 输出</th><th>延迟</th><th>状态</th><th><span class="sr-only">操作</span></th></tr></thead><tbody id="usage-log-body"></tbody></table></div>
+        <div id="usage-log-cards" class="log-cards"></div>
+        <div id="usage-log-empty" class="analytics-empty hd"><i class="fas fa-list-alt" aria-hidden="true"></i><h3>没有符合条件的日志</h3><p>调整时间范围或清除筛选条件后重试。</p></div>
+        <div class="log-pagination"><span id="log-page-label">第 1 页</span><div><button id="log-prev" class="btn btn-s" type="button" onclick="changeLogPage(-1)">上一页</button><button id="log-next" class="btn btn-s" type="button" onclick="changeLogPage(1)">下一页</button></div></div>
+        <p class="sampling-note"><i class="fas fa-info-circle" aria-hidden="true"></i>数据来自 Cloudflare Analytics Engine，可能经过采样，适合运营观测，不作为完整审计记录。</p>
       </section>
 
       <section id="providers" class="workspace-section" aria-labelledby="providers-title">
@@ -407,6 +454,7 @@ ${H('管理')}
 <div id="modal" class="modal-o hd" role="presentation" onclick="if(event.target===this)closeM()"><div class="modal" id="mc" role="dialog" aria-modal="true" aria-live="polite"></div></div>
 
 <script>${SHARED_JS}
+${ANALYTICS_JS}
 // copy
 function copyText(t, el) {
   const i = el.tagName === 'I' ? el : (el.querySelector('i') || el.parentElement?.querySelector('i'))
