@@ -121,7 +121,6 @@ html:focus-within { scroll-behavior: smooth; }
 .site-page > main { flex: 1; }
 .hd { display: none !important; }
 .sr-only { position: absolute; width: .0625rem; height: .0625rem; padding: 0; margin: -.0625rem; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
-.sr-status { min-height: 1lh; color: var(--color-muted); font-size: var(--text-xs); }
 
 /* shared navigation */
 .topbar { position: sticky; inset-block-start: 0; z-index: 100; min-height: 4rem; border-block-end: .0625rem solid var(--color-rule); background: var(--color-paper-a); color: var(--color-ink); backdrop-filter: blur(.75rem); }
@@ -141,13 +140,12 @@ html:focus-within { scroll-behavior: smooth; }
   white-space: nowrap;
   transition: background-color var(--dur-fast) ease, border-color var(--dur-fast) ease, color var(--dur-fast) ease, transform var(--dur-fast) ease;
 }
-.btn { min-height: var(--control-h); padding-inline: var(--space-sm); display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2xs); font-size: var(--text-sm); font-weight: 600; line-height: 1; }
+.btn { min-height: var(--control-h-sm); padding-inline: var(--space-sm); display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2xs); font-size: var(--text-sm); font-weight: 600; line-height: 1; }
 .btn-p { border-color: var(--color-accent); background: var(--color-accent); color: var(--color-accent-ink); }
 .btn-s { border-color: var(--color-rule-2); background: var(--color-paper); color: var(--color-ink-2); }
 .btn-gh { border-color: transparent; background: transparent; color: var(--color-muted); }
 .btn-g { border-color: var(--color-success-soft); background: var(--color-success-soft); color: var(--color-success-ink); }
 .btn-d { border-color: var(--color-danger-soft); background: var(--color-danger-soft); color: var(--color-danger-ink); }
-.btn-xs { min-height: var(--control-h); padding-inline: var(--space-xs); font-size: var(--text-md); }
 .icon-btn, .password-toggle { width: var(--control-h-sm); height: var(--control-h-sm); flex: 0 0 var(--control-h-sm); display: inline-grid; place-items: center; border-color: transparent; background: transparent; color: var(--color-muted); }
 .icon-btn span { font-family: var(--font-body); font-size: var(--text-xs); }
 .copy-control[data-state='success'] { border-color: var(--color-success); color: var(--color-success-ink); }
@@ -237,7 +235,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .provider-row__identity p { margin-block-start: var(--space-3xs); display: flex; flex-wrap: wrap; gap: var(--space-2xs); color: var(--color-muted); font-size: var(--text-xs); }
 .provider-row__identity code { color: var(--color-ink-2); }
 .provider-row__models { min-width: 0; display: flex; flex-wrap: wrap; gap: var(--space-2xs); }
-.model-token { max-width: 100%; min-height: var(--control-h); padding-inline: var(--space-xs); display: inline-flex; align-items: center; gap: var(--space-2xs); border-color: var(--color-rule); background: var(--color-paper-2); color: var(--color-ink-2); }
+.model-token { max-width: 100%; min-height: var(--control-h-sm); padding-inline: var(--space-xs); display: inline-flex; align-items: center; gap: var(--space-2xs); border-color: var(--color-rule); background: var(--color-paper-2); color: var(--color-ink-2); }
 .model-token code { overflow: hidden; font-size: var(--text-xs); text-overflow: ellipsis; white-space: nowrap; }
 .model-token i { color: var(--color-muted); }
 .status-badge, .bd, .protocol-chip, .status-dot { display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2xs); width: max-content; min-height: 1.75rem; padding-inline: var(--space-xs); border-radius: var(--radius-round); font-size: var(--text-xs); font-weight: 600; white-space: nowrap; }
@@ -393,6 +391,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .c-p { color: var(--color-accent); }
 .c-l, .c-muted, .mu { color: var(--color-muted); }
 .c-s { color: var(--color-success); }
+
 /* 复制成功态需压过 .model-token i / .mdl-item i:first-child 的 muted 色（0,2,0 > 0,1,1） */
 .model-token i.c-s, .mdl-item i.c-s, .mdl-item i:first-child.c-s { color: var(--color-success); }
 .c-d { color: var(--color-danger); }

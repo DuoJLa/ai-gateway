@@ -18,6 +18,8 @@
 - **使用统计与详细日志** — 基于 Analytics Engine 展示请求总量、成功率、输入/输出 Token、平均延迟、模型/渠道排行，并支持请求日志筛选与详情查看
 - **管理后台** — Cloud Workbench 控制平面 UI，支持桌面侧栏与移动端日志卡片，无需前端构建
 
+**如需看板及token使用统计功能，可以使用此 Fork 版：[DuoJLa/ai-gateway](https://github.com/DuoJLa/ai-gateway)**
+
 ## 技术栈
 
 - **运行时**：Cloudflare Workers
