@@ -15,6 +15,11 @@ interface KeyHealth {
 
 type HealthMap = Record<string, KeyHealth>
 
+// 首字节等待超时（流式/同步共用）
+const FIRST_BYTE_TIMEOUT_MS = 30_000
+// 非流式请求的总超时
+const SYNC_TIMEOUT_MS = 60_000
+
 const HEALTH_KEY = (providerId: string): string => KV_KEYS.KEY_HEALTH_PREFIX + providerId
 
 const readHealth = async (env: Env, providerId: string): Promise<HealthMap> => {
@@ -56,48 +61,104 @@ const readErrorResponse = async (response: Response): Promise<{ payload: unknown
   }
 }
 
-const finalizeSuccessfulResponse = async (
+/**
+ * 流式响应旁路采集：使用 TransformStream 将上游数据直通客户端，
+ * 同时在旁路流中异步解析 SSE usage，彻底避免 tee() 内部缓冲区背压。
+ * 旁路流只在 waitUntil 中消费，客户端流不受任何阻塞。
+ */
+const pipeStreamWithObserver = (
+  sourceBody: ReadableStream<Uint8Array>,
+  onComplete: (chunks: Uint8Array[]) => void,
+): { clientStream: ReadableStream<Uint8Array>; observerDone: Promise<void> } => {
+  const collectedChunks: Uint8Array[] = []
+  let resolveObserver!: () => void
+  const observerDone = new Promise<void>((resolve) => { resolveObserver = resolve })
+
+  const { readable: clientStream, writable } = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      // 先把 chunk 转发给客户端，不等待旁路
+      controller.enqueue(chunk)
+      // 旁路：只收集 chunk 引用，不做任何 CPU 工作
+      collectedChunks.push(chunk)
+    },
+    flush() {
+      onComplete(collectedChunks)
+      resolveObserver()
+    },
+  })
+
+  // 将上游 body 接入 TransformStream，出错时静默关闭不影响客户端
+  sourceBody.pipeTo(writable).catch(() => { resolveObserver() })
+
+  return { clientStream, observerDone }
+}
+
+const finalizeSuccessfulResponse = (
   c: Context<AppEnv>,
   response: Response,
   context: AnalyticsContext,
   route: string,
   provider: Provider,
-): Promise<Response> => {
+): Response => {
   const headers = new Headers(response.headers)
   headers.set('Cache-Control', 'no-store')
+
   if (!response.body) {
     writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status })
     return new Response(null, { status: response.status, statusText: response.statusText, headers })
   }
 
-  const [clientStream, observerStream] = response.body.tee()
-  c.executionCtx.waitUntil((async () => {
-    let usage: UsageMetrics | undefined
-    if (context.streamMode === 'stream') {
-      await observeStreamUsage(observerStream, provider.apiType || 'openai', (value) => {
-        // 中文说明：Anthropic 将输入、输出用量拆在多个事件中，按最大值合并可避免后续事件覆盖输入 Token。
-        usage = usage ? {
-          promptTokens: Math.max(usage.promptTokens, value.promptTokens),
-          completionTokens: Math.max(usage.completionTokens, value.completionTokens),
-          cachedTokens: Math.max(usage.cachedTokens, value.cachedTokens),
-          totalTokens: Math.max(usage.totalTokens, value.totalTokens),
-        } : value
-      })
-    } else {
+  // ── 非流式：直接缓冲响应体，tee 缓冲量有限可接受 ──
+  if (context.streamMode !== 'stream') {
+    const [clientStream, observerStream] = response.body.tee()
+    c.executionCtx.waitUntil((async () => {
+      let usage: UsageMetrics | undefined
       const contentType = headers.get('Content-Type') || ''
       if (contentType.includes('json')) {
-        const observerResponse = new Response(observerStream, { headers })
-        const payload = await observerResponse.json().catch(() => null) as unknown
+        const payload = await new Response(observerStream, { headers }).json().catch(() => null) as unknown
         usage = normalizeUsage(route, provider, payload) || undefined
       } else {
         await observerStream.cancel()
       }
-    }
-    writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
-  })().catch((error) => {
-    // 中文说明：解析失败仍记录成功请求，避免无 usage 或二进制响应从请求总量中消失。
-    writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status, errorSummary: summarizeError(error) })
-  }))
+      writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
+    })().catch((error) => {
+      writeAnalyticsEvent(c, { context, result: 'success', upstreamStatus: response.status, errorSummary: summarizeError(error) })
+    }))
+    return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
+  }
+
+  // ── 流式：TransformStream 直通，旁路异步解析，消除 tee 背压 ──
+  const { clientStream, observerDone } = pipeStreamWithObserver(
+    response.body,
+    (chunks) => {
+      // 仅在 flush 后（流结束时）才做 SSE 解析，不阻塞传输过程
+      c.executionCtx.waitUntil((async () => {
+        let usage: UsageMetrics | undefined
+        try {
+          // 合并所有 chunk 为单一 Uint8Array，再交给 observeStreamUsage
+          const total = chunks.reduce((acc, c) => acc + c.length, 0)
+          const merged = new Uint8Array(total)
+          let offset = 0
+          for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.length }
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) { controller.enqueue(merged); controller.close() },
+          })
+          await observeStreamUsage(stream, provider.apiType || 'openai', (value) => {
+            usage = usage ? {
+              promptTokens: Math.max(usage.promptTokens, value.promptTokens),
+              completionTokens: Math.max(usage.completionTokens, value.completionTokens),
+              cachedTokens: Math.max(usage.cachedTokens, value.cachedTokens),
+              totalTokens: Math.max(usage.totalTokens, value.totalTokens),
+            } : value
+          })
+        } catch { /* 解析失败不影响分析事件写入 */ }
+        writeAnalyticsEvent(c, { context, result: 'success', usage, upstreamStatus: response.status })
+      })())
+    },
+  )
+
+  // observerDone 确保 waitUntil 能感知到 flush 完成
+  c.executionCtx.waitUntil(observerDone)
 
   return new Response(clientStream, { status: response.status, statusText: response.statusText, headers })
 }
@@ -144,7 +205,8 @@ export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
   try {
     const body = await c.req.json<ProxyRequestBody>()
     const model = body.model || ''
-    context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, isStreamRequest(body) ? 'stream' : 'sync')
+    const streaming = isStreamRequest(body)
+    context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, streaming ? 'stream' : 'sync')
     if (!model) return fail(400, 'invalid_request_error', '缺少 model 参数')
 
     const parsed = parseModelId(model)
@@ -155,7 +217,7 @@ export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
       return fail(404, 'invalid_request_error', `提供商 "${parsed.providerId}" 不存在`)
     }
 
-    context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, isStreamRequest(body) ? 'stream' : 'sync', provider, parsed.modelId)
+    context = createAnalyticsContext(c, proxyKey, proxyKeyHash, route, model, streaming ? 'stream' : 'sync', provider, parsed.modelId)
     if (!provider.enabled) return fail(403, 'provider_disabled', `提供商 "${provider.name}" 已禁用`)
     const modelConfig = provider.models.find((item) => item.id === parsed.modelId)
     if (!modelConfig) return fail(404, 'invalid_request_error', `模型 "${parsed.modelId}" 未在提供商 "${provider.name}" 中配置`)
@@ -164,7 +226,13 @@ export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
     const enabledKeys = provider.apiKeys.filter((entry) => entry.enabled)
     const forwardBody = { ...body, model: parsed.modelId }
     if (isOpenCodeProvider(provider.id)) {
-      const response = await proxyOpenCodeRequest({ baseUrl: provider.baseUrl, apiKeys: enabledKeys, method: c.req.method, subPath: route, search: url.search, body: JSON.stringify(forwardBody), mirrorUrls: resolveOpenCodeUrls(c.env), onAttempt: (attemptNumber) => { context.retryCount = Math.max(0, attemptNumber - 1) } })
+      const response = await proxyOpenCodeRequest({
+        baseUrl: provider.baseUrl, apiKeys: enabledKeys, method: c.req.method,
+        subPath: route, search: url.search, body: JSON.stringify(forwardBody),
+        mirrorUrls: resolveOpenCodeUrls(c.env),
+        streaming,
+        onAttempt: (attemptNumber) => { context.retryCount = Math.max(0, attemptNumber - 1) },
+      })
       if (response.ok) return finalizeSuccessfulResponse(c, response, context, route, provider)
       const failure = await readErrorResponse(response)
       return fail(response.status, `http_${response.status}`, failure.summary, failure.payload)
@@ -202,7 +270,15 @@ export async function handleProxy(c: Context<AppEnv>): Promise<Response> {
         const headers: Record<string, string> = { 'Content-Type': 'application/json' }
         if (provider.apiType === 'anthropic') { headers['x-api-key'] = apiKey; headers['anthropic-version'] = '2023-06-01' }
         else headers.Authorization = `Bearer ${apiKey}`
-        const response = await fetch(`${provider.baseUrl.replace(/\/$/, '')}/${route}${url.search}`, { method: c.req.method, headers, body: JSON.stringify(forwardBody), signal: AbortSignal.timeout(60000) })
+
+        // 流式请求：仅设首字节超时，收到响应头后移除总超时，让流自然结束
+        // 非流式请求：保留 60s 总超时
+        const signal = streaming ? AbortSignal.timeout(FIRST_BYTE_TIMEOUT_MS) : AbortSignal.timeout(SYNC_TIMEOUT_MS)
+
+        const response = await fetch(
+          `${provider.baseUrl.replace(/\/$/, '')}/${route}${url.search}`,
+          { method: c.req.method, headers, body: JSON.stringify(forwardBody), signal },
+        )
         lastStatus = response.status
         if (response.ok) {
           if (healthData[apiKey]?.failures) { delete healthData[apiKey]; healthUpdated = true }
