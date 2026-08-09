@@ -9,7 +9,7 @@ const TARGET = "https://ps.air-outer.com";
 // 官方客户端的 User-Agent(站点白名单校验)
 const OFFICIAL_UA = "Kilo-Code/7.3.50 ai-sdk/provider-utils/4.0.27 runtime/bun/1.3.14";
 
-// 转发时剔除的逐跳(Hop-by-hop)请求头,交给 fetch 自动重建
+// 转发时剥除的逐跳(Hop-by-hop)请求头,交给 fetch 自动重建
 const HOP_HEADERS = [
   "host", "connection", "keep-alive", "transfer-encoding",
   "upgrade", "proxy-authenticate", "proxy-authorization",
@@ -35,6 +35,9 @@ export default {
       method: request.method,
       headers,
       redirect: "manual",
+      // 传递客户端断开信号：客户端取消时立即终止上游请求，
+      // 避免 Worker 空走消耗 CPU 时间和上游 token 配额
+      signal: request.signal,
     };
 
     // 携带请求体(GET/HEAD 不带)
