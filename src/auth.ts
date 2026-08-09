@@ -1,6 +1,6 @@
 import { Context, Next } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
-import { createSession, getSession, deleteSession, getValidProxyKey } from './storage'
+import { createSession, getSession, deleteSession, getValidProxyKeyByHash, getValidProxyKey } from './storage'
 import { SESSION_TTL } from './config'
 import type { AppEnv, Env } from './types'
 
@@ -90,7 +90,14 @@ export async function handleLogout(c: Context<{ Bindings: Env }>) {
   return c.redirect('/')
 }
 
-/** 转发 API Key 验证中间件 */
+/**
+ * 转发 API Key 验证中间件
+ *
+ * 优化策略：
+ * 1. 计算一次 SHA-256(token)，复用于 KV 索引查找和 analytics proxyKeyHash。
+ * 2. getValidProxyKeyByHash() 做 O(1) 直接 KV 读取（无需加载全量 keys 数组）。
+ * 3. 若索引未命中（迁移前的旧 key），自动回退到 getValidProxyKey() 线性扫描。
+ */
 export async function proxyKeyAuthMiddleware(c: Context<AppEnv>, next: Next) {
   const authHeader = c.req.header('Authorization')
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -100,15 +107,21 @@ export async function proxyKeyAuthMiddleware(c: Context<AppEnv>, next: Next) {
   }
 
   const token = authHeader.slice(7)
-  const proxyKey = await getValidProxyKey(c.env, token)
+
+  // 一次 SHA-256，复用于 KV 索引键 和 analytics 哈希字段
+  const tokenHash = await hashPassword(token)          // 64 hex chars (SHA-256)
+  const shortHash = tokenHash.slice(0, 32)             // 32 chars，用于 analytics
+
+  // O(1) 直接 KV 查找；迁移前旧 key 自动回退线性扫描
+  const proxyKey = await getValidProxyKeyByHash(c.env, tokenHash)
   if (!proxyKey) {
     return c.json({
       error: { message: 'API Key 无效或已禁用', type: 'authentication_error' },
     }, 401)
   }
 
-  // 中文说明：只把令牌对象和不可逆哈希放入请求上下文，观测层绝不持久化原始 sk_cf_*。
+  // 只把令牌对象和不可逆哈希放入请求上下文，观测层绝不持久化原始 sk_cf_*
   c.set('proxyKey', proxyKey)
-  c.set('proxyKeyHash', (await hashPassword(token)).slice(0, 32))
+  c.set('proxyKeyHash', shortHash)
   return next()
 }
