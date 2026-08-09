@@ -33,12 +33,26 @@ const app = new Hono<AppEnv>()
 app.use('*', cors())
 app.use('*', logger())
 
-// 首次请求时填充虚拟数据
-let seeded = false
+/**
+ * 初始化种子数据——改为异步 waitUntil 执行，不阻塞请求热路径。
+ *
+ * 原因：冷启动时 seedInitialData 最多触发 5 次串行 KV I/O，
+ * 在 Workers 平均 KV 延迟 50-200ms 的环境下最多您贵 1s，
+ * 直接决定了流式请求是否能在 60s 超时内完成。
+ *
+ * module-level Promise 缓存：同一 isolate 内并发请求时不会重复执行 seed。
+ */
+let seedPromise: Promise<void> | null = null
 app.use('*', async (c, next) => {
-  if (!seeded) {
-    await seedInitialData(c.env)
-    seeded = true
+  if (!seedPromise) {
+    // 立即执行 next()，不等待 seed 完成
+    seedPromise = seedInitialData(c.env).catch((err) => {
+      // seed 失败时重置，下次请求再尝试
+      console.error('[seed] 初始化失败，将在下次请求重试:', err)
+      seedPromise = null
+    })
+    // 不阻塞：直接将 seed task 挂起并继续处理请求
+    c.executionCtx.waitUntil(seedPromise)
   }
   return next()
 })
@@ -49,7 +63,7 @@ app.get('/', async (c) => {
   const sessionId = getCookie(c, 'session_id')
   let isLoggedIn = false
   if (sessionId) {
-const session = await getSession(c.env, sessionId)
+    const session = await getSession(c.env, sessionId)
     isLoggedIn = session !== null
   }
   return renderHomePage(c, isLoggedIn)

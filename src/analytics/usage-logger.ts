@@ -28,7 +28,6 @@ export const writeAnalyticsEvent = (
   const latencyMs = Math.max(0, Date.now() - context.startedAt)
 
   try {
-    // 中文说明：只写入最终客户端请求事件，避免内部 Key fallback 把一次请求重复算入总量。
     dataset.writeDataPoint({
       indexes: [context.tokenHash],
       blobs: [
@@ -69,11 +68,18 @@ export const writeAnalyticsEvent = (
       ],
     })
   } catch (error) {
-    // 中文说明：观测写入失败不能阻断模型代理，否则监控故障会扩大为业务故障。
     console.error(`[analytics] 写入数据集 ${getDatasetName(c.env)} 失败`, error)
   }
 }
 
+/**
+ * 解析 SSE 流中的 usage 指标。
+ *
+ * 优化要点：
+ * 1. 滑动窗口 buffer：every flush 后只保留未终止的尾局段，避免 buffer 单调增长。
+ * 2. 快速跳过：对于不含 'usage' 关键字的 chunk（占流式输出的绝大多数），
+ *    字符串级判断后直接跳过 JSON.parse，大幅减少 V8 CPU 压力。
+ */
 export const observeStreamUsage = async (
   stream: ReadableStream<Uint8Array>,
   providerType: string,
@@ -87,11 +93,19 @@ export const observeStreamUsage = async (
       const chunk = await reader.read()
       if (chunk.done) break
       buffer += decoder.decode(chunk.value, { stream: true })
-      const lines = buffer.split(/\r?\n/)
-      buffer = lines.pop() || ''
-      for (const line of lines) {
+
+      // 将 buffer 按换行拆分，只保留未终止的尾部段（滑动窗口）
+      const newlineIdx = buffer.lastIndexOf('\n')
+      if (newlineIdx === -1) continue // 整个 buffer 都是未终止段，等待更多数据
+
+      const completeLines = buffer.slice(0, newlineIdx)
+      buffer = buffer.slice(newlineIdx + 1) // 只保留尾部未终止居
+
+      for (const line of completeLines.split(/\r?\n/)) {
         const raw = line.replace(/^data:\s*/, '').trim()
         if (!raw || raw === '[DONE]') continue
+        // 快速跳过无 usage 的普通 delta chunk（占流式响应的绝大多数）
+        if (!raw.includes('"usage"')) continue
         try {
           const parsed: unknown = JSON.parse(raw)
           const usage = providerType === 'anthropic'
@@ -124,7 +138,7 @@ const normalizeStreamUsage = (value: unknown): UsageMetrics | null => {
       ?? 0,
   )
   return {
-    promptTokens: promptTokens,
+    promptTokens,
     completionTokens,
     cachedTokens,
     totalTokens: Number(item.total_tokens || promptTokens + completionTokens),
