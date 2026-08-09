@@ -3,7 +3,9 @@ import type { ApiKeyEntry, Env } from './types'
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
 const OPENCODE_VERSION = '1.17.8'
-const OPENCODE_TIMEOUT_MS = 60000
+const OPENCODE_TIMEOUT_MS = 60_000
+// 流式请求只对首字节设超时，接收到响应头后让流自然结束
+const OPENCODE_FIRST_BYTE_TIMEOUT_MS = 30_000
 
 interface OpenCodeRequestOptions {
   baseUrl: string
@@ -13,6 +15,8 @@ interface OpenCodeRequestOptions {
   mirrorUrls: string[]
   search?: string
   body?: string
+  /** 是否为流式请求，影响超时策略 */
+  streaming?: boolean
   fetcher?: typeof fetch
   random?: () => number
   onAttempt?: (attemptNumber: number) => void
@@ -46,7 +50,6 @@ export function filterOpenCodeModels<T extends { id?: unknown }>(models: T[]): T
 
 export function resolveOpenCodeUrls(env: Env): string[] {
   const raw = env.OPENCODE_MIRRORS_URL || ''
-  // 兼容换行符、逗号、空格分隔；过滤空白；全局去重
   const parts = raw.split('\n').flatMap(s => s.split(',')).map(s => s.trim()).filter(Boolean)
   return [...new Set(parts)]
 }
@@ -122,13 +125,16 @@ async function requestUpstream(
   apiKey: string,
   options: OpenCodeRequestOptions,
   requestId: string,
-  sessionId: string
+  sessionId: string,
 ): Promise<Response> {
+  // 流式请求仅等待首字节，接收到响应头后不再限制总时长
+  // 非流式请求保留原 60s 总超时
+  const timeoutMs = options.streaming ? OPENCODE_FIRST_BYTE_TIMEOUT_MS : OPENCODE_TIMEOUT_MS
   return fetcher(url, {
     method: options.method,
     headers: createRequestHeaders(apiKey, requestId, sessionId),
     body: options.method === 'GET' || options.method === 'HEAD' ? undefined : options.body,
-    signal: AbortSignal.timeout(OPENCODE_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   })
 }
 
@@ -149,16 +155,8 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
     attemptNumber++
     options.onAttempt?.(attemptNumber)
     try {
-      const response = await requestUpstream(
-        fetcher,
-        officialUrl,
-        entry.key,
-        options,
-        requestId,
-        sessionId
-      )
+      const response = await requestUpstream(fetcher, officialUrl, entry.key, options, requestId, sessionId)
       if (response.ok) return response
-
       officialFailure = await storeFailure(response)
       if (response.status !== 401 && response.status !== 403 && response.status !== 429) break
     } catch (error) {
@@ -177,7 +175,7 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
         'public',
         options,
         requestId,
-        sessionId
+        sessionId,
       )
       if (response.ok) return response
       mirrorFailure = await storeFailure(response)
@@ -196,65 +194,34 @@ export async function testOpenCodeModel(
   apiKeys: ApiKeyEntry[],
   modelId: string,
   mirrorUrls: string[],
-  fetcher?: typeof fetch
+  fetcher?: typeof fetch,
 ): Promise<OpenCodeTestResult> {
   const response = await proxyOpenCodeRequest({
-    baseUrl,
-    apiKeys,
-    mirrorUrls,
-    method: 'POST',
-    subPath: 'chat/completions',
-    body: JSON.stringify({
-      model: modelId,
-      messages: [{ role: 'user', content: 'hi' }],
-      max_tokens: 1,
-    }),
+    baseUrl, apiKeys, mirrorUrls, method: 'POST', subPath: 'chat/completions',
+    streaming: false,
+    body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
     fetcher,
   })
-
-  if (response.ok) {
-    return { success: true, message: '连接成功', statusCode: response.status }
-  }
-
+  if (response.ok) return { success: true, message: '连接成功', statusCode: response.status }
   const body = await response.text()
-  return {
-    success: false,
-    message: `HTTP ${response.status}: ${body.substring(0, 200)}`,
-    statusCode: response.status,
-  }
+  return { success: false, message: `HTTP ${response.status}: ${body.substring(0, 200)}`, statusCode: response.status }
 }
 
 export async function fetchOpenCodeModels(
   baseUrl: string,
   apiKeys: ApiKeyEntry[],
   mirrorUrls: string[],
-  fetcher?: typeof fetch
+  fetcher?: typeof fetch,
 ): Promise<OpenCodeTestResult> {
   const response = await proxyOpenCodeRequest({
-    baseUrl,
-    apiKeys,
-    mirrorUrls,
-    method: 'GET',
-    subPath: 'models',
-    fetcher,
+    baseUrl, apiKeys, mirrorUrls, method: 'GET', subPath: 'models', streaming: false, fetcher,
   })
-
   if (!response.ok) {
-    return {
-      success: false,
-      message: `HTTP ${response.status}: ${(await response.text()).substring(0, 200)}`,
-      statusCode: response.status,
-    }
+    return { success: false, message: `HTTP ${response.status}: ${(await response.text()).substring(0, 200)}`, statusCode: response.status }
   }
-
   const data = await response.json() as { data?: Array<{ id?: unknown }> }
   return {
-    success: true,
-    message: '连接成功',
-    statusCode: response.status,
-    data: {
-      ...data,
-      data: Array.isArray(data.data) ? filterOpenCodeModels(data.data) : [],
-    },
+    success: true, message: '连接成功', statusCode: response.status,
+    data: { ...data, data: Array.isArray(data.data) ? filterOpenCodeModels(data.data) : [] },
   }
 }
