@@ -1,7 +1,9 @@
 import { KV_KEYS } from './config'
 import type { Env, Provider, ProxyKey, Session } from './types'
+import { invalidateProvidersCache, invalidateProxyKeysCache } from './cache'
 
 // ===== 提供商 CRUD =====
+// 优化项 #4: setProviders / setProxyKeys 写穿时同步清空内存缓存
 
 export async function getProviders(env: Env): Promise<Provider[]> {
   const data = await env.KV.get(KV_KEYS.PROVIDERS)
@@ -15,6 +17,7 @@ export async function getProvider(env: Env, id: string): Promise<Provider | null
 
 export async function setProviders(env: Env, providers: Provider[]): Promise<void> {
   await env.KV.put(KV_KEYS.PROVIDERS, JSON.stringify(providers))
+  invalidateProvidersCache() // 优化项 #4: 写穿失效，同 isolate 内立即生效
 }
 
 export async function addProvider(env: Env, provider: Provider): Promise<void> {
@@ -78,6 +81,7 @@ export async function getProxyKeys(env: Env): Promise<ProxyKey[]> {
 
 export async function setProxyKeys(env: Env, keys: ProxyKey[]): Promise<void> {
   await env.KV.put(KV_KEYS.PROXY_KEYS, JSON.stringify(keys))
+  invalidateProxyKeysCache() // 优化项 #4: 写穿失效
 }
 
 export async function addProxyKey(env: Env, key: ProxyKey): Promise<void> {

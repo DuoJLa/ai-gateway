@@ -1,9 +1,11 @@
 import type { ApiKeyEntry, Env } from './types'
+import { STREAM_IDLE_TIMEOUT_MS, SYNC_TIMEOUT_MS } from './config'
 
 export const OPENCODE_PROVIDER_ID = 'opencode'
 
 const OPENCODE_VERSION = '1.17.8'
-const OPENCODE_TIMEOUT_MS = 60000
+// 优化项 #8: 失败体限量读取，避免大错误体全量读入内存
+const MAX_ERROR_BODY_BYTES = 8_192
 
 interface OpenCodeRequestOptions {
   baseUrl: string
@@ -13,6 +15,10 @@ interface OpenCodeRequestOptions {
   mirrorUrls: string[]
   search?: string
   body?: string
+  /** 是否为流式请求，影响超时策略 */
+  streaming?: boolean
+  /** 优化项 #1: 客户端取消信号，合并到上游 fetch */
+  clientSignal?: AbortSignal
   fetcher?: typeof fetch
   random?: () => number
 }
@@ -21,7 +27,8 @@ interface StoredFailure {
   status: number
   statusText: string
   headers: Headers
-  body: ArrayBuffer
+  // 优化项 #8: 错误体限量存储为 Uint8Array（前 8KB），不全量 arrayBuffer
+  body: Uint8Array
 }
 
 export interface OpenCodeTestResult {
@@ -43,11 +50,21 @@ export function filterOpenCodeModels<T extends { id?: unknown }>(models: T[]): T
   ))
 }
 
+/**
+ * 优化项 #14: 镜像 URL 解析缓存
+ * 原因：环境变量运行时不变，但每次请求都重新分割/去重。
+ * 缓存后同 isolate 内只解析一次。
+ */
+let mirrorUrlsCache: { raw: string; urls: string[] } | null = null
+
 export function resolveOpenCodeUrls(env: Env): string[] {
   const raw = env.OPENCODE_MIRRORS_URL || ''
-  // 兼容换行符、逗号、空格分隔；过滤空白；全局去重
+  // 缓存命中：raw 未变则直接返回已解析结果
+  if (mirrorUrlsCache?.raw === raw) return mirrorUrlsCache.urls
   const parts = raw.split('\n').flatMap(s => s.split(',')).map(s => s.trim()).filter(Boolean)
-  return [...new Set(parts)]
+  const urls = [...new Set(parts)]
+  mirrorUrlsCache = { raw, urls }
+  return urls
 }
 
 function getMirrorOrder(urls: string[], random: () => number): string[] {
@@ -88,12 +105,35 @@ function createRequestHeaders(apiKey: string, requestId: string, sessionId: stri
   })
 }
 
+/**
+ * 优化项 #8: 失败体限量读取
+ * 原因：原代码 await response.arrayBuffer() 完整读入内存，
+ *   大错误体或慢速结束的失败连接会拖慢回退。
+ * 方案：只读前 MAX_ERROR_BODY_BYTES 字节，保留诊断信息足够。
+ */
 async function storeFailure(response: Response): Promise<StoredFailure> {
+  const reader = response.body?.getReader()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+  if (reader) {
+    try {
+      while (totalBytes < MAX_ERROR_BODY_BYTES) {
+        const { done, value } = await reader.read()
+        if (done || !value) break
+        chunks.push(value)
+        totalBytes += value.length
+      }
+    } catch { /* 读取失败保留已读部分 */ }
+    reader.cancel().catch(() => undefined)
+  }
+  const body = new Uint8Array(totalBytes)
+  let offset = 0
+  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.length }
   return {
     status: response.status,
     statusText: response.statusText,
     headers: new Headers(response.headers),
-    body: await response.arrayBuffer(),
+    body,
   }
 }
 
@@ -123,11 +163,18 @@ async function requestUpstream(
   requestId: string,
   sessionId: string
 ): Promise<Response> {
+  // 优化项 #2: 流式用 STREAM_IDLE_TIMEOUT，非流式用 SYNC_TIMEOUT
+  const timeoutMs = options.streaming ? STREAM_IDLE_TIMEOUT_MS : SYNC_TIMEOUT_MS
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  // 优化项 #1: 合并客户端取消信号与超时信号
+  const signals: AbortSignal[] = [timeoutSignal]
+  if (options.clientSignal) signals.push(options.clientSignal)
+  const signal = AbortSignal.any(signals)
   return fetcher(url, {
     method: options.method,
     headers: createRequestHeaders(apiKey, requestId, sessionId),
     body: options.method === 'GET' || options.method === 'HEAD' ? undefined : options.body,
-    signal: AbortSignal.timeout(OPENCODE_TIMEOUT_MS),
+    signal,
   })
 }
 
@@ -144,6 +191,8 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
   const officialUrl = buildUrl(options.baseUrl, options.subPath, options.search)
 
   for (const entry of enabledKeys) {
+    // 优化项 #1: 客户端取消时停止重试
+    if (options.clientSignal?.aborted) break
     try {
       const response = await requestUpstream(
         fetcher,
@@ -158,12 +207,15 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
       officialFailure = await storeFailure(response)
       if (response.status !== 401 && response.status !== 403 && response.status !== 429) break
     } catch (error) {
+      if (options.clientSignal?.aborted) break
       lastTransportError = error
       break
     }
   }
 
   for (const mirror of getMirrorOrder(options.mirrorUrls, random)) {
+    // 优化项 #1: 客户端取消时停止镜像轮询
+    if (options.clientSignal?.aborted) break
     try {
       const response = await requestUpstream(
         fetcher,
@@ -171,11 +223,12 @@ export async function proxyOpenCodeRequest(options: OpenCodeRequestOptions): Pro
         'public',
         options,
         requestId,
-        sessionId
+        sessionId,
       )
       if (response.ok) return response
       mirrorFailure = await storeFailure(response)
     } catch (error) {
+      if (options.clientSignal?.aborted) break
       lastTransportError = error
     }
   }
@@ -190,7 +243,7 @@ export async function testOpenCodeModel(
   apiKeys: ApiKeyEntry[],
   modelId: string,
   mirrorUrls: string[],
-  fetcher?: typeof fetch
+  fetcher?: typeof fetch,
 ): Promise<OpenCodeTestResult> {
   const response = await proxyOpenCodeRequest({
     baseUrl,
@@ -198,6 +251,7 @@ export async function testOpenCodeModel(
     mirrorUrls,
     method: 'POST',
     subPath: 'chat/completions',
+    streaming: false,
     body: JSON.stringify({
       model: modelId,
       messages: [{ role: 'user', content: 'hi' }],
@@ -222,7 +276,7 @@ export async function fetchOpenCodeModels(
   baseUrl: string,
   apiKeys: ApiKeyEntry[],
   mirrorUrls: string[],
-  fetcher?: typeof fetch
+  fetcher?: typeof fetch,
 ): Promise<OpenCodeTestResult> {
   const response = await proxyOpenCodeRequest({
     baseUrl,
@@ -230,6 +284,7 @@ export async function fetchOpenCodeModels(
     mirrorUrls,
     method: 'GET',
     subPath: 'models',
+    streaming: false,
     fetcher,
   })
 

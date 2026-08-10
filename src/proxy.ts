@@ -1,19 +1,13 @@
 import { Context } from 'hono'
-import { getProvider, getProviders } from './storage'
-import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES } from './config'
+import { getCachedProvider, getCachedProviders } from './cache'
+import { KV_KEYS, KEY_HEALTH_COOLDOWN_MS, KEY_HEALTH_MAX_FAILURES, RATE_LIMIT_DEFAULT_COOLDOWN_MS, RATE_LIMIT_MAX_COOLDOWN_MS, STREAM_IDLE_TIMEOUT_MS, SYNC_TIMEOUT_MS, TOTAL_BUDGET_MS } from './config'
+import type { KeyHealth } from './config'
 import type { Env, ProxyRequestBody } from './types'
 import { isOpenCodeProvider, proxyOpenCodeRequest, resolveOpenCodeUrls } from './opencode'
 
-// ===== Key 健康状态类型和辅助函数 =====
-
-interface KeyHealth {
-  failures: number
-  lastFailed: boolean
-  demotedAt?: number  // 首次达到降权阈值的时间戳 (Date.now())
-}
 type HealthMap = Record<string, KeyHealth>
 
-const HEALTH_KEY = (providerId: string) => KV_KEYS.KEY_HEALTH_PREFIX + providerId
+const HEALTH_KEY = (providerId: string): string => KV_KEYS.KEY_HEALTH_PREFIX + providerId
 
 async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
   const raw = await env.KV.get(HEALTH_KEY(providerId))
@@ -21,17 +15,70 @@ async function readHealth(env: Env, providerId: string): Promise<HealthMap> {
 }
 
 async function writeHealth(env: Env, providerId: string, health: HealthMap): Promise<void> {
-  // 只保存有失败记录的 key，避免 KV 膨胀
+  // 只保存有失败/限流记录的 key，避免 KV 膨胀
   const filtered: HealthMap = {}
   for (const [k, v] of Object.entries(health)) {
-    if (v.failures > 0) filtered[k] = v
+    if (v.failures > 0 || v.rateLimitedUntil) filtered[k] = v
   }
   if (Object.keys(filtered).length > 0) {
     await env.KV.put(HEALTH_KEY(providerId), JSON.stringify(filtered))
   } else {
-    // 全部健康，删除 KV 条目
     await env.KV.delete(HEALTH_KEY(providerId)).catch(() => {})
   }
+}
+
+/**
+ * 优化项 #2 + #5: 合并客户端取消信号 + 超时信号 + 总预算
+ * 原因：原代码只用独立超时信号，客户端断连后 Worker 继续占用上游连接。
+ *   固定 60s × N Key 顺序重试导致用户最多等 N×60s。
+ * 方案：AbortSignal.any() 合并三路信号——客户端取消、超时、总预算。
+ */
+function createUpstreamSignal(clientSignal: AbortSignal | undefined, timeoutMs: number, budgetSignal: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const signals: AbortSignal[] = [timeoutSignal, budgetSignal]
+  if (clientSignal) signals.push(clientSignal)
+  return AbortSignal.any(signals)
+}
+
+/** 判断 abort 是否来自客户端取消（非超时/预算）——不记为 Key 不健康 */
+function isClientCancelled(clientSignal: AbortSignal | undefined): boolean {
+  return clientSignal?.aborted === true
+}
+
+/**
+ * 优化项 #7: 从 429 响应中提取限流冷却时长
+ * 优先读 Retry-After 头，否则用默认值；上限 RATE_LIMIT_MAX_COOLDOWN_MS
+ */
+function extract429Cooldown(response: Response): number {
+  const retryAfter = response.headers.get('retry-after')
+  if (retryAfter) {
+    const seconds = parseInt(retryAfter, 10)
+    if (!isNaN(seconds) && seconds > 0) return Math.min(seconds * 1000, RATE_LIMIT_MAX_COOLDOWN_MS)
+  }
+  return Math.min(RATE_LIMIT_DEFAULT_COOLDOWN_MS, RATE_LIMIT_MAX_COOLDOWN_MS)
+}
+
+/**
+ * 优化项 #9: 响应头白名单透传
+ * 原因：原代码只保留 Content-Type + Cache-Control，丢失 x-request-id 等上游元数据。
+ *   "透传全部"会带入 hop-by-hop 头导致问题。
+ * 方案：白名单透传，排除 hop-by-hop 头。
+ */
+const HOP_BY_HOP_HEADERS = new Set([
+  'content-length', 'connection', 'transfer-encoding',
+  'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'upgrade', 'host',
+])
+
+function buildPassthroughHeaders(upstreamHeaders: Headers): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const [key, value] of upstreamHeaders.entries()) {
+    if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+      result[key] = value
+    }
+  }
+  result['Cache-Control'] = 'no-store'
+  return result
 }
 
 /** 解析模型 ID，如 "deepseek/deepseek-chat" → { providerId, modelId } */
@@ -42,6 +89,11 @@ function parseModelId(model: string): { providerId: string; modelId: string } | 
     providerId: model.substring(0, slashIndex),
     modelId: model.substring(slashIndex + 1),
   }
+}
+
+/** 检测是否为流式请求 */
+function isStreamRequest(body: ProxyRequestBody): boolean {
+  return body.stream === true
 }
 
 /** 测试模型连接，发送最小请求验证 */
@@ -104,7 +156,7 @@ export async function testModelConnection(
 }
 
 /** 处理 /v1/chat/completions 等 API 转发 */
-export async function handleProxy(c: Context<{ Bindings: Env }>) {
+export async function handleProxy(c: Context<{ Bindings: Env }>): Promise<Response> {
   try {
     const body = await c.req.json<ProxyRequestBody>()
     const model = body.model
@@ -124,7 +176,8 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     }
 
     const { providerId, modelId } = parsed
-    const provider = await getProvider(c.env, providerId)
+    // 优化项 #4: 走内存缓存读取 provider，消除每请求 KV 读
+    const provider = await getCachedProvider(c.env, providerId)
 
     if (!provider) {
       return c.json({
@@ -151,9 +204,12 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     }
 
     const enabledKeys = provider.apiKeys.filter(k => k.enabled)
-    const forwardBody = { ...body, model: modelId }
+    // 优化项 #10: 原地修改 model 字段，只序列化一次，重试时复用
+    body.model = modelId
+    const forwardBodyStr = JSON.stringify(body)
     const url = new URL(c.req.url)
     const subPath = url.pathname.replace(/^\/v1\//, '') || 'chat/completions'
+    const streaming = isStreamRequest(body)
 
     if (isOpenCodeProvider(providerId)) {
       const response = await proxyOpenCodeRequest({
@@ -162,13 +218,16 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
         method: c.req.method,
         subPath,
         search: url.search,
-        body: JSON.stringify(forwardBody),
+        body: forwardBodyStr,
         mirrorUrls: resolveOpenCodeUrls(c.env),
+        streaming,
+        clientSignal: c.req.raw.signal, // 优化项 #1: 传递客户端取消信号
       })
+      // 优化项 #9: 响应头白名单透传
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
-        headers: response.headers,
+        headers: buildPassthroughHeaders(response.headers),
       })
     }
 
@@ -181,28 +240,31 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
     const cleanBase = provider.baseUrl.replace(/\/$/, '')
     const forwardUrl = `${cleanBase}/${subPath}${url.search}`
 
-    // 按健康状态排序 key：健康→洗牌，不健康→末尾，冷却到期→试用，连续失败3次→降权排除
-    const healthData = await readHealth(c.env, providerId)
+    // 优化项 #11: 单 Key 时跳过 health 读取，避免浪费 KV 读
+    const now = Date.now()
+    const healthData: HealthMap = enabledKeys.length > 1 ? await readHealth(c.env, providerId) : {}
     const healthy: number[] = []
     const unhealthy: number[] = []
     const probation: number[] = []
     const demoted: number[] = []
+    const rateLimited: number[] = []
 
     if (enabledKeys.length === 1) {
-      // 只有一个 key，跳过健康检查，直接使用
       healthy.push(0)
     } else {
       for (let i = 0; i < enabledKeys.length; i++) {
         const h = healthData[enabledKeys[i].key]
+        // 优化项 #7: 429 限流冷却期内的 Key 排入限流组
+        if (h?.rateLimitedUntil && h.rateLimitedUntil > now) {
+          rateLimited.push(i)
+          continue
+        }
         if (h && h.failures >= KEY_HEALTH_MAX_FAILURES) {
-          // 兼容旧数据：无 demotedAt 视为现在刚降权，统一走冷却逻辑
-          if (!h.demotedAt) {
-            h.demotedAt = Date.now()
-          }
-          if (Date.now() - h.demotedAt >= KEY_HEALTH_COOLDOWN_MS) {
-            probation.push(i)  // 冷却到期，进入试用组
+          if (!h.demotedAt) h.demotedAt = now
+          if (now - h.demotedAt >= KEY_HEALTH_COOLDOWN_MS) {
+            probation.push(i)
           } else {
-            demoted.push(i)    // 仍在冷却，继续保持降权
+            demoted.push(i)
           }
         } else if (h && h.lastFailed) {
           unhealthy.push(i)
@@ -212,28 +274,36 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
       }
     }
 
-    // Fisher-Yates 洗牌（仅健康 key）
-    for (let i = healthy.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [healthy[i], healthy[j]] = [healthy[j], healthy[i]]
+    // Fisher-Yates 洗牌（仅健康 key 且多于 1 个时）—— 优化项 P3-3
+    if (healthy.length > 1) {
+      for (let i = healthy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [healthy[i], healthy[j]] = [healthy[j], healthy[i]]
+      }
     }
 
     const keyOrder = [...healthy, ...unhealthy, ...probation]
 
-    // 所有 key 都在冷却中时，降级尝试 demoted key（修复旧数据缺失 demotedAt 的死循环）
-    if (keyOrder.length === 0 && demoted.length > 0) {
-      keyOrder.push(...demoted)
-      console.log(`[proxy] ${providerId}: all keys demoted, falling back to ${demoted.length} key(s)`)
+    // 所有 key 都在冷却中时，降级尝试 demoted + rateLimited key
+    if (keyOrder.length === 0 && (demoted.length > 0 || rateLimited.length > 0)) {
+      keyOrder.push(...demoted, ...rateLimited)
+      console.log(`[proxy] ${providerId}: all keys demoted/rate-limited, falling back to ${keyOrder.length} key(s)`)
     }
 
-    if (demoted.length > 0 || probation.length > 0) {
-      console.log(`[proxy] ${providerId}: ${demoted.length} key(s) demoted, ${probation.length} key(s) on probation (cooldown expired)`)
-    }
+    // 优化项 #5: 总请求预算，所有 Key 重试共享
+    const budgetController = new AbortController()
+    const budgetTimer = setTimeout(() => budgetController.abort(), TOTAL_BUDGET_MS)
+    const clientSignal = c.req.raw.signal // 优化项 #1: 客户端取消信号
 
     let lastError: Response | null = null
+    let lastErrorStatus = 0
+    let lastErrorMessage = '没有可用的 API Key'
     let healthUpdated = false
 
     for (const keyIndex of keyOrder) {
+      // 预算耗尽或客户端取消 → 停止重试
+      if (budgetController.signal.aborted || isClientCancelled(clientSignal)) break
+
       const apiKey = enabledKeys[keyIndex].key
       try {
         const forwardHeaders: Record<string, string> = {
@@ -246,35 +316,49 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           forwardHeaders['Authorization'] = `Bearer ${apiKey}`
         }
 
+        // 优化项 #2: 流式用 STREAM_IDLE_TIMEOUT（首包后不限制总时长）
+        //   非流式用 SYNC_TIMEOUT；都合并客户端取消信号 + 总预算
+        const timeoutMs = streaming ? STREAM_IDLE_TIMEOUT_MS : SYNC_TIMEOUT_MS
+        const signal = createUpstreamSignal(clientSignal, timeoutMs, budgetController.signal)
+
         const response = await fetch(forwardUrl, {
           method: c.req.method,
           headers: forwardHeaders,
-          body: JSON.stringify(forwardBody),
-          signal: AbortSignal.timeout(60000),
+          body: forwardBodyStr,
+          signal,
         })
 
         if (response.ok) {
           // 成功：重置健康状态
-          if (healthData[apiKey]?.failures > 0) {
+          if (healthData[apiKey]?.failures > 0 || healthData[apiKey]?.rateLimitedUntil) {
             delete healthData[apiKey]
             healthUpdated = true
           }
-          if (healthUpdated) await writeHealth(c.env, providerId, healthData)
-
-          const responseHeaders: Record<string, string> = {
-            'Content-Type': response.headers.get('Content-Type') || 'application/json',
-            'Cache-Control': 'no-store',
+          // 优化项 #3: 健康状态异步落盘，不阻塞 TTFT
+          if (healthUpdated) {
+            c.executionCtx.waitUntil(writeHealth(c.env, providerId, healthData).catch((e) => {
+              console.error('[health] 异步写入失败:', e)
+            }))
           }
+          clearTimeout(budgetTimer)
+
+          // 优化项 #9: 响应头白名单透传
           return new Response(response.body, {
             status: response.status,
-            headers: responseHeaders,
+            headers: buildPassthroughHeaders(response.headers),
           })
         }
 
-        // 429 限流：跳过当前 key，不标记失败
+        // 优化项 #7: 429 纳入限流冷却
         if (response.status === 429) {
+          const cooldown = extract429Cooldown(response)
+          const h = healthData[apiKey] || { failures: 0, lastFailed: false }
+          h.rateLimitedUntil = Date.now() + cooldown
+          healthData[apiKey] = h
+          healthUpdated = true
           lastError = response
-          continue
+          lastErrorStatus = 429
+          continue // 切下一个 Key，不 failures++
         }
 
         // 401/403/5xx 尝试下一个 key（标记失败）
@@ -283,48 +367,63 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
           h.failures++
           h.lastFailed = true
           if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
-            h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
+            h.demotedAt = Date.now()
           }
           healthData[apiKey] = h
           healthUpdated = true
           lastError = response
+          lastErrorStatus = response.status
           continue
         }
 
         // 其他错误（400/404 等）直接返回
         const errorData = await response.json().catch(async () => ({ error: { message: await response.text() } }))
+        if (healthUpdated) {
+          c.executionCtx.waitUntil(writeHealth(c.env, providerId, healthData).catch((e) => {
+            console.error('[health] 异步写入失败:', e)
+          }))
+        }
+        clearTimeout(budgetTimer)
         return c.json(errorData, response.status as Parameters<typeof c.json>[1])
       } catch (err) {
-        const error = err as Error
-        // 网络错误也标记为失败
-        const h = healthData[apiKey] || { failures: 0, lastFailed: false }
-        h.failures++
-        h.lastFailed = true
-        if (h.failures >= KEY_HEALTH_MAX_FAILURES) {
-          h.demotedAt = Date.now()  // 达到降权阈值或试用失败，重置冷却计时
+        // 优化项 #1: 客户端取消 → 不记失败，直接返回
+        if (isClientCancelled(clientSignal)) {
+          clearTimeout(budgetTimer)
+          return c.json({ error: { message: '客户端取消请求', type: 'client_cancelled' } }, 502)
         }
-        healthData[apiKey] = h
-        healthUpdated = true
+
+        // 优化项 #6: 网络错误（非 HTTP 状态码错误）不标记 Key 失败
+        // 原因：DNS/TCP/超时等基础设施问题与 Key 无关，不应连累健康 Key 被降权
+        const error = err as Error
+        lastErrorStatus = 502
+        lastErrorMessage = error.message || '请求失败'
         lastError = new Response(JSON.stringify({
-          error: { message: error.message || '请求失败', type: 'proxy_error' },
+          error: { message: lastErrorMessage, type: 'proxy_error' },
         }), { status: 502 })
+        // 不做 health.failures++，只记录 lastError 并切下一个 Key
         continue
       }
     }
 
-    // 写回健康状态
-    if (healthUpdated) await writeHealth(c.env, providerId, healthData)
+    clearTimeout(budgetTimer)
+
+    // 优化项 #3: 健康状态异步落盘
+    if (healthUpdated) {
+      c.executionCtx.waitUntil(writeHealth(c.env, providerId, healthData).catch((e) => {
+        console.error('[health] 异步写入失败:', e)
+      }))
+    }
 
     // 所有 key 均失败
     if (lastError) {
-      const errorBody = await lastError.text().catch(() => '所有 API Key 均失败')
+      const errorBody = await lastError.text().catch(() => lastErrorMessage)
       return c.json({
         error: {
-          message: `所有 API Key 已用完，最后一次错误: HTTP ${lastError.status}`,
+          message: `所有 API Key 已用完，最后一次错误: HTTP ${lastErrorStatus}`,
           type: 'key_exhausted',
           detail: errorBody.substring(0, 500),
         },
-      }, (lastError.status || 502) as Parameters<typeof c.json>[1])
+      }, (lastErrorStatus || 502) as Parameters<typeof c.json>[1])
     }
 
     return c.json({
@@ -339,8 +438,9 @@ export async function handleProxy(c: Context<{ Bindings: Env }>) {
 }
 
 /** 处理 /v1/models — 返回所有已启用的模型（含提供商前缀） */
-export async function handleModels(c: Context<{ Bindings: Env }>) {
-  const providers = await getProviders(c.env)
+export async function handleModels(c: Context<{ Bindings: Env }>): Promise<Response> {
+  // 优化项 #4: /v1/models 走内存缓存
+  const providers = await getCachedProviders(c.env)
 
   const models: Array<{
     id: string

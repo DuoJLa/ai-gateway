@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { logger } from 'hono/logger'
+import { getCookie } from 'hono/cookie' // 优化项 #12: 静态 import，替代每次请求的动态 import
 import type { Env } from './types'
 import { adminAuthMiddleware, proxyKeyAuthMiddleware, handleLogin, handleLogout } from './auth'
 import { handleProxy, handleModels } from './proxy'
@@ -25,25 +25,32 @@ const app = new Hono<{ Bindings: Env }>()
 
 // ===== 全局中间件 =====
 app.use('*', cors())
-app.use('*', logger())
+// 优化项 #13: 移除 logger() 中间件——每请求写日志有 I/O 开销，保留 onError 的 error 日志即可
 
-// 首次请求时填充虚拟数据
-let seeded = false
+/**
+ * 优化项 #16: seedInitialData 并发竞态修复
+ * 原因：原代码用布尔标志 seeded，冷启动并发请求可能同时通过检查导致多次执行。
+ * 方案：module-level Promise 锁，保证同 isolate 内只执行一次。
+ */
+let seedPromise: Promise<void> | null = null
 app.use('*', async (c, next) => {
-  if (!seeded) {
-    await seedInitialData(c.env)
-    seeded = true
+  if (!seedPromise) {
+    // 不阻塞请求热路径：seed 失败时重置，下次请求重试
+    seedPromise = seedInitialData(c.env).catch((err) => {
+      console.error('[seed] 初始化失败，将在下次请求重试:', err)
+      seedPromise = null
+    })
   }
   return next()
 })
 
 // ===== 首页 =====
 app.get('/', async (c) => {
-  const { getCookie } = await import('hono/cookie')
+  // 优化项 #12: 使用顶部静态 import 的 getCookie
   const sessionId = getCookie(c, 'session_id')
   let isLoggedIn = false
   if (sessionId) {
-const session = await getSession(c.env, sessionId)
+    const session = await getSession(c.env, sessionId)
     isLoggedIn = session !== null
   }
   return renderHomePage(c, isLoggedIn)
