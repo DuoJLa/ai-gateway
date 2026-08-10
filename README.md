@@ -17,7 +17,6 @@
 - **模型连接测试** — 管理后台手动测试模型是否可连接（通过服务端代理，无跨域限制）
 - **管理后台** — 卡片式 UI，移动端自适应，无需前端构建
 
-**如需看板及token使用统计功能，可以使用此 Fork 版：[DuoJLa/ai-gateway](https://github.com/DuoJLa/ai-gateway)**
 
 ## 技术栈
 
