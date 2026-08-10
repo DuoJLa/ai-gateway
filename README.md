@@ -115,11 +115,3 @@ ai-gateway/
 ├── tsconfig.json
 └── .github/workflows/deploy.yml
 ```
-
-## License
-
-Apache 2.0
-
-## 鸣谢
-
-感谢 [DuoJLa](https://github.com/DuoJLa/ai-gateway) 贡献的前端代码
