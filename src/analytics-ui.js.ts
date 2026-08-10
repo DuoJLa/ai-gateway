@@ -18,6 +18,73 @@ function formatLatency(value) {
   return number >= 1000 ? (number / 1000).toFixed(2) + 's' : Math.round(number) + 'ms'
 }
 
+function formatBeijingTime(value) {
+  const date = new Date(String(value || ''))
+  if (Number.isNaN(date.getTime())) return '—'
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  }).format(date)
+}
+
+function getBeijingDateParts(date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(date).reduce(function(result, part) {
+    if (part.type !== 'literal') result[part.type] = part.value
+    return result
+  }, {})
+  return { year: Number(parts.year), month: Number(parts.month), day: Number(parts.day) }
+}
+
+function toDateTimeLocalValue(date) {
+  // 这里的 Date 用 UTC 字段承载北京时间的墙上时间，避免再次套用时区导致偏移 8 小时。
+  return String(date.getUTCFullYear()).padStart(4, '0') + '-' + String(date.getUTCMonth() + 1).padStart(2, '0') + '-' + String(date.getUTCDate()).padStart(2, '0') + 'T' + String(date.getUTCHours()).padStart(2, '0') + ':' + String(date.getUTCMinutes()).padStart(2, '0') + ':' + String(date.getUTCSeconds()).padStart(2, '0')
+}
+
+function getBeijingDateAtMidnight(offsetDays) {
+  const now = new Date()
+  const parts = getBeijingDateParts(now)
+  return new Date(Date.UTC(parts.year, parts.month - 1, parts.day + offsetDays, 0, 0, 0))
+}
+
+function getLogPresetRange(preset) {
+  const now = new Date()
+  const today = getBeijingDateParts(now)
+  let startOffset = 0
+  let endDate = getBeijingDateAtMidnight(0)
+  if (preset === '7d') startOffset = -6
+  if (preset === '30d') startOffset = -29
+  if (preset === 'week') {
+    const current = new Date(Date.UTC(today.year, today.month - 1, today.day))
+    startOffset = 1 - (current.getUTCDay() || 7)
+  }
+  if (preset === 'month') startOffset = 1 - today.day
+  const start = getBeijingDateAtMidnight(startOffset)
+  endDate = new Date(endDate.getTime() + 24 * 60 * 60 * 1000 - 1000)
+  return { start: toDateTimeLocalValue(start), end: toDateTimeLocalValue(endDate) }
+}
+
+function applyLogPreset(preset) {
+  if (!preset) return
+  const range = getLogPresetRange(preset)
+  document.getElementById('log-start').value = range.start
+  document.getElementById('log-end').value = range.end
+  document.getElementById('log-start-range').value = preset
+  document.getElementById('log-end-range').value = preset
+}
+
+function getLogTimeParam(value) {
+  if (!value) return ''
+  const [datePart, timePart] = value.split('T')
+  const [year, month, day] = datePart.split('-').map(Number)
+  const [hour, minute, second = '0'] = timePart.split(':')
+  // datetime-local 的值按北京时间解释，显式转换为 UTC，避免设备时区影响查询。
+  const utc = Date.UTC(year, month - 1, day, Number(hour), Number(minute), Number(second))
+  return new Date(utc - 8 * 60 * 60 * 1000).toISOString()
+}
+
+
 async function fetchAnalytics(path, signal) {
   const response = await fetch(path, { signal: signal })
   const payload = await response.json().catch(function() { return { success: false, message: '响应格式错误' } })
@@ -127,11 +194,11 @@ function renderLogRecords(records) {
   empty.classList.add('hd')
   table.innerHTML = analyticsLogRecords.map(function(record, index) {
     const success = getLogField(record, 'blob8') === 'success'
-    return '<tr><td><time>' + escapeHtml(new Date(String(record.timestamp)).toLocaleString('zh-CN')) + '</time></td><td><span class="status-badge ' + logStatusClass(record) + '"><i></i>' + (success ? '成功' : '失败') + '</span></td><td><code title="' + escapeHtml(getLogField(record, 'blob6')) + '">' + escapeHtml(getLogField(record, 'blob6') || '—') + '</code></td><td>' + escapeHtml(getLogField(record, 'blob4') || getLogField(record, 'blob3') || '—') + '</td><td class="numeric">' + formatMetric(record.double1) + ' / ' + formatMetric(record.double2) + '</td><td class="numeric">' + formatLatency(record.double5) + '</td><td class="numeric">' + escapeHtml(record.double7 || '—') + '</td><td><button class="btn btn-gh btn-xs" type="button" onclick="showUsageLogDetail(' + index + ')">查看</button></td></tr>'
+    return '<tr><td><time>' + escapeHtml(formatBeijingTime(record.timestamp)) + '</time></td><td><span class="status-badge ' + logStatusClass(record) + '"><i></i>' + (success ? '成功' : '失败') + '</span></td><td><code title="' + escapeHtml(getLogField(record, 'blob6')) + '">' + escapeHtml(getLogField(record, 'blob6') || '—') + '</code></td><td>' + escapeHtml(getLogField(record, 'blob4') || getLogField(record, 'blob3') || '—') + '</td><td class="numeric">' + formatMetric(record.double1) + ' / ' + formatMetric(record.double2) + '</td><td class="numeric">' + formatLatency(record.double5) + '</td><td class="numeric">' + escapeHtml(record.double7 || '—') + '</td><td><button class="btn btn-gh btn-xs" type="button" onclick="showUsageLogDetail(' + index + ')">查看</button></td></tr>'
   }).join('')
   cards.innerHTML = analyticsLogRecords.map(function(record, index) {
     const success = getLogField(record, 'blob8') === 'success'
-    return '<button class="log-card" type="button" onclick="showUsageLogDetail(' + index + ')"><span><span class="status-badge ' + logStatusClass(record) + '"><i></i>' + (success ? '成功' : '失败') + '</span><time>' + escapeHtml(new Date(String(record.timestamp)).toLocaleString('zh-CN')) + '</time></span><code>' + escapeHtml(getLogField(record, 'blob6') || '未知模型') + '</code><small>' + escapeHtml(getLogField(record, 'blob4') || getLogField(record, 'blob3') || '未知渠道') + ' · 输入 ' + formatMetric(record.double1) + ' · 输出 ' + formatMetric(record.double2) + ' · ' + formatLatency(record.double5) + '</small></button>'
+    return '<button class="log-card" type="button" onclick="showUsageLogDetail(' + index + ')"><span><span class="status-badge ' + logStatusClass(record) + '"><i></i>' + (success ? '成功' : '失败') + '</span><time>' + escapeHtml(formatBeijingTime(record.timestamp)) + '</time></span><code>' + escapeHtml(getLogField(record, 'blob6') || '未知模型') + '</code><small>' + escapeHtml(getLogField(record, 'blob4') || getLogField(record, 'blob3') || '未知渠道') + ' · 输入 ' + formatMetric(record.double1) + ' · 输出 ' + formatMetric(record.double2) + ' · ' + formatLatency(record.double5) + '</small></button>'
   }).join('')
 }
 
@@ -139,7 +206,7 @@ function showUsageLogDetail(index) {
   const record = analyticsLogRecords[index]
   if (!record) return
   const fields = [
-    ['时间', new Date(String(record.timestamp)).toLocaleString('zh-CN')], ['结果', getLogField(record, 'blob8')], ['路由', getLogField(record, 'blob1')], ['渠道', getLogField(record, 'blob4') || getLogField(record, 'blob3')],
+    ['时间', formatBeijingTime(record.timestamp)], ['结果', getLogField(record, 'blob8')], ['路由', getLogField(record, 'blob1')], ['渠道', getLogField(record, 'blob4') || getLogField(record, 'blob3')],
     ['Provider ID', getLogField(record, 'blob3')], ['Provider 类型', getLogField(record, 'blob5')], ['请求模型', getLogField(record, 'blob6')], ['上游模型', getLogField(record, 'blob7')],
     ['输入 Token', record.double1], ['输出 Token', record.double2], ['缓存 Token', record.double3], ['总 Token', record.double4], ['延迟', formatLatency(record.double5)], ['重试次数', record.double6], ['上游状态', record.double7],
     ['Request ID', getLogField(record, 'blob12')], ['Trace ID', getLogField(record, 'blob13')], ['客户端 IP', getLogField(record, 'blob14')], ['User-Agent', getLogField(record, 'blob15')], ['位置', [record.blob16, record.blob17, record.blob18].filter(Boolean).join(' / ')], ['Colo', getLogField(record, 'blob19')], ['错误代码', getLogField(record, 'blob10')], ['错误摘要', getLogField(record, 'blob20')]
@@ -153,8 +220,8 @@ async function loadUsageLogs(resetPage) {
   errorBox.classList.add('hd')
   const params = new URLSearchParams({ page: String(analyticsLogPage), dimension: document.getElementById('log-dimension').value, keyword: document.getElementById('log-keyword').value.trim(), result: document.getElementById('log-result').value })
   const start = document.getElementById('log-start').value, end = document.getElementById('log-end').value
-  if (start) params.set('start', new Date(start).toISOString())
-  if (end) params.set('end', new Date(end).toISOString())
+  if (start) params.set('start', getLogTimeParam(start))
+  if (end) params.set('end', getLogTimeParam(end))
   try {
     const data = await fetchAnalytics('/admin/api/usage-logs?' + params.toString())
     renderLogRecords(data.records)
@@ -169,7 +236,7 @@ async function loadUsageLogs(resetPage) {
 
 function changeLogPage(offset) { analyticsLogPage = Math.max(1, analyticsLogPage + offset); loadUsageLogs(false) }
 function resetLogFilters() {
-  document.getElementById('log-start').value = ''; document.getElementById('log-end').value = ''; document.getElementById('log-keyword').value = ''; document.getElementById('log-result').value = 'all'; document.getElementById('log-dimension').value = 'model'; loadUsageLogs(true)
+  document.getElementById('log-start').value = ''; document.getElementById('log-end').value = ''; document.getElementById('log-start-range').value = ''; document.getElementById('log-end-range').value = ''; document.getElementById('log-keyword').value = ''; document.getElementById('log-result').value = 'all'; document.getElementById('log-dimension').value = 'model'; loadUsageLogs(true)
 }
 
 loadAnalytics()

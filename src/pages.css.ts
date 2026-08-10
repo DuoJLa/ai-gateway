@@ -444,6 +444,7 @@ label, legend { color: var(--color-ink-2); font-size: var(--text-xs); font-weigh
 .analytics-empty h3 { font-size: var(--text-md); }
 .log-filter { margin-block-start: var(--space-md); padding: var(--space-sm); display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-sm); border: .0625rem solid var(--color-rule); border-radius: var(--radius-panel); background: var(--color-paper); }
 .log-filter label { display: block; margin-block-end: var(--space-2xs); }
+.log-filter select + input { margin-block-start: var(--space-2xs); }
 .log-filter__actions { display: flex; align-items: end; gap: var(--space-2xs); }
 .log-table-wrap { margin-block-start: var(--space-md); overflow-x: auto; border: .0625rem solid var(--color-rule); border-radius: var(--radius-panel); background: var(--color-paper); }
 .log-table { width: 100%; border-collapse: collapse; white-space: nowrap; }
