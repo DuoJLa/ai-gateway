@@ -79,9 +79,8 @@ function getLogTimeParam(value) {
   const [datePart, timePart] = value.split('T')
   const [year, month, day] = datePart.split('-').map(Number)
   const [hour, minute, second = '0'] = timePart.split(':')
-  // datetime-local 的值按北京时间解释，显式转换为 UTC，避免设备时区影响查询。
   const utc = Date.UTC(year, month - 1, day, Number(hour), Number(minute), Number(second))
-  return new Date(utc - 8 * 60 * 60 * 1000).toISOString()
+  return new Date(utc).toISOString() // 直接 UTC，无 -8h 偏移
 }
 
 
